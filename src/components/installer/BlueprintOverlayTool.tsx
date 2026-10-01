@@ -1,5 +1,5 @@
 import React, { useRef } from 'react';
-import { Upload, RotateCw, ZoomIn, Eye, Move, Trash2, Image as ImageIcon, CheckCircle2 } from 'lucide-react';
+import { Upload, RotateCw, ZoomIn, Eye, Move, Trash2, Image as ImageIcon, CheckCircle2, X } from 'lucide-react';
 
 export interface OverlaySettings {
   imageUrl: string | null;
@@ -16,12 +16,14 @@ interface BlueprintOverlayToolProps {
   settings: OverlaySettings;
   onChange: (settings: OverlaySettings) => void;
   onReset: () => void;
+  onClose?: () => void;
 }
 
 export const BlueprintOverlayTool: React.FC<BlueprintOverlayToolProps> = ({
   settings,
   onChange,
   onReset,
+  onClose,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -69,11 +71,22 @@ export const BlueprintOverlayTool: React.FC<BlueprintOverlayToolProps> = ({
             <p className="text-[10px] text-slate-500">Align drone photo or blueprint</p>
           </div>
         </div>
-        {settings.imageUrl && (
-          <span className="bg-emerald-50 text-emerald-600 text-[10px] font-semibold px-2.5 py-0.5 rounded-full flex items-center gap-1 border border-emerald-100">
-            <CheckCircle2 className="w-3 h-3" /> Active
-          </span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {settings.imageUrl && (
+            <span className="bg-emerald-50 text-emerald-600 text-[10px] font-semibold px-2.5 py-0.5 rounded-full flex items-center gap-1 border border-emerald-100">
+              <CheckCircle2 className="w-3 h-3" /> Active
+            </span>
+          )}
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="p-1 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition cursor-pointer"
+              title="Close panel"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* File Upload Trigger */}

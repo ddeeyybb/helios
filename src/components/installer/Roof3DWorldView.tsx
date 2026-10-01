@@ -23,12 +23,23 @@ import {
 } from 'lucide-react';
 
 import { SkyEnvironment3D } from './SkyEnvironment3D';
+import { HeliosRoofEngine } from '../HeliosRoofEngine';
 import { House3DEngine, ManualPanel, RoofStyle } from './House3DEngine';
 import { DigosGroundPlane, PerimeterPoint } from './DigosGroundPlane';
 import { MapEngineView, RoofFootprint } from './MapEngineView';
 import { AddHomeownerModal, HomeownerData, DIGOS_BARANGAYS } from './AddHomeownerModal';
 import { useSolarContext } from '../../SolarContext';
-import { fetchRoofSegmentation, getCroppedSatelliteSnippet } from '../../services/roofAiService';
+import {
+  fetchRoofSegmentation,
+  getCroppedSatelliteSnippet,
+  calculateGeographicDimensions,
+  calculatePolygonMetrics,
+} from '../../services/roofAiService';
+import {
+  TreeSegmentData,
+  RoofPolygonData,
+  isolateTargetRoof,
+} from '../../services/SolarShadowEngine';
 
 export interface SolarModulePreset {
   id: string;
@@ -89,7 +100,16 @@ export const SOLAR_MODULE_PRESETS: SolarModulePreset[] = [
 ];
 
 export const Roof3DWorldView: React.FC = () => {
-  const { addToast, activeClient, appState, setActiveView } = useSolarContext();
+  const {
+    addToast,
+    activeClient,
+    appState,
+    setActiveView,
+    activeTab,
+    setActiveTab,
+    selectedRoofData,
+    setSelectedRoofData,
+  } = useSolarContext();
 
   // Active Customer State synced with SolarContext activeClient
   const [activeCustomer, setActiveCustomer] = useState<HomeownerData>({
@@ -103,8 +123,10 @@ export const Roof3DWorldView: React.FC = () => {
     dailyNeedKwh: activeClient?.dailyNeedKwh || 28,
   });
 
-  // UI Modes ('3d' vs 'map')
-  const [activeViewMode, setActiveViewMode] = useState<'3d' | 'map'>('3d');
+  // UI Modes ('3d' vs 'map' vs 'spatial')
+  const [activeViewMode, setActiveViewMode] = useState<'3d' | 'map' | 'spatial'>(
+    activeTab === 'map' ? 'map' : '3d'
+  );
   const [sunlightLevel, setSunlightLevel] = useState<'HIGH' | 'LOW'>('HIGH');
   const [isPerimeterMode, setIsPerimeterMode] = useState<boolean>(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
@@ -119,11 +141,46 @@ export const Roof3DWorldView: React.FC = () => {
 
   // ---------------- 1. EMPTY START STATE & DIMENSIONS ----------------
   const [hasRoof, setHasRoof] = useState<boolean>(false);
-  const [roofStyle, setRoofStyle] = useState<RoofStyle>('gable');
+  const [roofStyle, setRoofStyle] = useState<RoofStyle>('hip');
   const [pitchDeg, setPitchDeg] = useState<number>(15);
-  const [baseWidth, setBaseWidth] = useState<number>(8.0);
+  const [baseWidth, setBaseWidth] = useState<number>(12.0);
   const [baseLength, setBaseLength] = useState<number>(10.0);
+  const [polygonPoints, setPolygonPoints] = useState<Array<[number, number]> | undefined>(undefined);
   const [dailyNeedKwh, setDailyNeedKwh] = useState<number>(activeCustomer.dailyNeedKwh);
+
+  // Sync activeViewMode with activeTab from context
+  useEffect(() => {
+    if (activeTab === '3d' || activeTab === 'map') {
+      setActiveViewMode(activeTab);
+    }
+  }, [activeTab]);
+
+  // Sync roof telemetry and geometry whenever selectedRoofData changes
+  useEffect(() => {
+    if (selectedRoofData) {
+      if (selectedRoofData.polygonCoordinates && selectedRoofData.polygonCoordinates.length >= 3) {
+        setPolygonPoints(selectedRoofData.polygonCoordinates);
+      }
+      if (selectedRoofData.widthMeters) {
+        setBaseWidth(Math.max(1.0, Number(selectedRoofData.widthMeters.toFixed(1))));
+      }
+      if (selectedRoofData.lengthMeters) {
+        setBaseLength(Math.max(1.0, Number(selectedRoofData.lengthMeters.toFixed(1))));
+      }
+      if (selectedRoofData.roofType) {
+        setRoofStyle(selectedRoofData.roofType as RoofStyle);
+      } else if (selectedRoofData.polygonCoordinates && selectedRoofData.polygonCoordinates.length > 4) {
+        setRoofStyle('complex');
+      }
+      if (typeof selectedRoofData.pitchDeg === 'number') {
+        setPitchDeg(selectedRoofData.pitchDeg);
+      }
+      if (typeof selectedRoofData.confidence === 'number') {
+        setAiConfidence(selectedRoofData.confidence);
+      }
+      setHasRoof(true);
+    }
+  }, [selectedRoofData]);
 
   // ---------------- 2. SOLAR MODULE SPECIFICATION STATE ----------------
   const [selectedModuleId, setSelectedModuleId] = useState<string>('rec_430');
@@ -136,6 +193,36 @@ export const Roof3DWorldView: React.FC = () => {
   const [isLandscape, setIsLandscape] = useState<boolean>(false);
   const [manualPanels, setManualPanels] = useState<ManualPanel[]>([]);
   const [perimeterPoints, setPerimeterPoints] = useState<PerimeterPoint[]>([]);
+
+  // ---------------- 3B. TREES & URBAN NEIGHBORHOOD ISOLATION STATE ----------------
+  const [trees, setTrees] = useState<TreeSegmentData[]>([
+    {
+      id: 'perimeter-tree-1',
+      x: -7.5,
+      z: -4.5,
+      heightMeters: 7.0,
+      canopyRadius: 3.2,
+      trunkRadius: 0.35,
+      species: 'mango',
+    },
+  ]);
+  const [contextRoofs, setContextRoofs] = useState<RoofPolygonData[]>([
+    {
+      id: 'neighbor-north',
+      polygon: [{ x: -6, z: -14 }, { x: 8, z: -14 }, { x: 8, z: -10 }, { x: -6, z: -10 }],
+      heightMeters: 3.8,
+    },
+    {
+      id: 'neighbor-east',
+      polygon: [{ x: 12, z: -4 }, { x: 20, z: -4 }, { x: 20, z: 6 }, { x: 12, z: 6 }],
+      heightMeters: 3.4,
+    },
+  ]);
+  const [obstructionStats, setObstructionStats] = useState<{ total: number; valid: number; obstructed: number }>({
+    total: 0,
+    valid: 0,
+    obstructed: 0,
+  });
 
   // Selected Module Object
   const selectedModule = useMemo(() => {
@@ -165,15 +252,21 @@ export const Roof3DWorldView: React.FC = () => {
   }, [activeClient, appState?.freshCanvasTimestamp]);
 
   // ---------------- 4. 3D ROOF & SOLAR MATHEMATICS (ZERO-DIVIDE GUARDED) ----------------
-  const isMono = roofStyle === 'mono';
-  const isFlat = roofStyle === 'flat';
-  const effectivePitch = isFlat ? 0 : Math.max(0, Math.min(45, pitchDeg || 0));
+  const styleLower = (roofStyle || '').toLowerCase();
+  const isFlat = styleLower.includes('flat') || styleLower.includes('deck');
+  const isMinimal = styleLower.includes('minimal') || styleLower.includes('mono') || styleLower.includes('shed');
+  const isMono = isMinimal;
+  const isHip = styleLower.includes('trapezoid') || styleLower.includes('hip') || styleLower.includes('pyramid');
+  const isPolygon = styleLower.includes('polygon') || styleLower.includes('complex') || (polygonPoints && polygonPoints.length > 4);
+  const isTriangle = styleLower.includes('triangle') || styleLower.includes('gable');
+
+  const effectivePitch = isFlat ? 0 : isMinimal ? Math.max(5, Math.min(20, pitchDeg || 8)) : Math.max(0, Math.min(45, pitchDeg || 15));
   const pitchRad = (effectivePitch * Math.PI) / 180;
   const cosPitch = Math.cos(pitchRad);
   const safeCos = cosPitch > 0.0001 ? cosPitch : 1.0;
 
-  const safeW = Math.max(1.0, Math.min(100.0, baseWidth || 1.0));  // X-axis (building length)
-  const safeL = Math.max(1.0, Math.min(100.0, baseLength || 1.0)); // Z-axis (eaves span)
+  const safeW = Math.max(1.0, Math.min(100.0, baseWidth || 1.0));  // X-axis (building width)
+  const safeL = Math.max(1.0, Math.min(100.0, baseLength || 1.0)); // Z-axis (building length)
   const halfDepth = safeL / 2;
 
   const slantLength3D = hasRoof && safeL > 0
@@ -196,8 +289,11 @@ export const Roof3DWorldView: React.FC = () => {
     return manualPanels.length;
   }, [hasRoof, panelLayoutMode, autoEnabled, rows, cols, isMono, manualPanels]);
 
-  // Dynamic System Power Size (kW) = (Selected Watts * Panel Count) / 1000
-  const systemSizeKW = (panelCount * selectedModule.wattage) / 1000;
+  // Exclude obstructed / shaded panels from effective active system power size
+  const validPanelCount = obstructionStats.total > 0 ? obstructionStats.valid : panelCount;
+
+  // Dynamic System Power Size (kW) = (Selected Watts * Valid Panel Count) / 1000
+  const systemSizeKW = (validPanelCount * selectedModule.wattage) / 1000;
 
   // Southern Mindanao Solar Irradiance (4.5 PSH standard base)
   const peakSunHours = sunlightLevel === 'HIGH' ? 4.5 : 3.6;
@@ -216,33 +312,92 @@ export const Roof3DWorldView: React.FC = () => {
     );
   }, [searchQuery]);
 
-  // Handle roof captured from MapLibre satellite tracing
+  // Handle roof captured from MapLibre satellite tracing or detected polygon click
   const handleRoofCaptured = (footprint: RoofFootprint) => {
     const clampedW = Math.max(1.0, Math.min(50.0, Number(footprint.widthMeters.toFixed(1))));
     const clampedL = Math.max(1.0, Math.min(50.0, Number(footprint.lengthMeters.toFixed(1))));
+    const pts = footprint.polygonPoints || footprint.corners;
+    const rType = footprint.roofType || (pts && pts.length > 4 ? 'complex' : 'hip');
+    const pitch = footprint.pitchDeg || 15;
+    const conf = footprint.confidence || 0.95;
+
+    // Construct full GeoJSON feature and selectedRoofData
+    const roofData = {
+      id: `roof-${Date.now()}`,
+      roofType: rType,
+      confidence: conf,
+      polygonCoordinates: pts,
+      widthMeters: clampedW,
+      lengthMeters: clampedL,
+      areaSqm: footprint.flatAreaSqm,
+      pitchDeg: pitch,
+      feature: {
+        type: 'Feature' as const,
+        properties: {
+          roofType: rType,
+          widthMeters: clampedW,
+          lengthMeters: clampedL,
+          areaSqm: footprint.flatAreaSqm,
+        },
+        geometry: {
+          type: 'Polygon' as const,
+          coordinates: [[...pts, pts[0]]],
+        },
+      },
+    };
+
+    if (setSelectedRoofData) {
+      setSelectedRoofData(roofData);
+    }
     setBaseWidth(clampedW);
     setBaseLength(clampedL);
+    setPolygonPoints(pts);
+    setRoofStyle(rType as RoofStyle);
+    setPitchDeg(pitch);
+    setAiConfidence(conf);
     setHasRoof(true);
     setAutoEnabled(false);
     setManualPanels([]);
+    if (setActiveTab) {
+      setActiveTab('3d');
+    }
     setActiveViewMode('3d');
 
     if (addToast) {
       addToast(
-        `Captured roof outline (${clampedW.toFixed(1)}m × ${clampedL.toFixed(1)}m). Extruded 3D Roof!`,
+        `⚡ Extruded 3D ${rType.toUpperCase()} Roof (${clampedW.toFixed(1)}m × ${clampedL.toFixed(1)}m, ${footprint.flatAreaSqm.toFixed(1)}m²)! Loaded 3D editor.`,
         'success'
       );
     }
   };
 
   const handleManualRoofInit = () => {
-    setBaseWidth(8.0);
+    setBaseWidth(12.0);
     setBaseLength(10.0);
+    setPolygonPoints(undefined);
+    setRoofStyle('hip');
     setHasRoof(true);
     setAutoEnabled(false);
     setManualPanels([]);
+    if (setSelectedRoofData) {
+      setSelectedRoofData({
+        id: `roof-default-${Date.now()}`,
+        roofType: 'hip',
+        confidence: 1.0,
+        polygonCoordinates: [
+          [125.35712, 6.74958],
+          [125.35724, 6.74958],
+          [125.35724, 6.74944],
+          [125.35712, 6.74944],
+        ],
+        widthMeters: 12.0,
+        lengthMeters: 10.0,
+        areaSqm: 120.0,
+        pitchDeg: 15,
+      });
+    }
     if (addToast) {
-      addToast('Created 3D roof plane (8.0m × 10.0m). Configure settings or place panels.', 'info');
+      addToast('Created 3D roof plane (12.0m × 10.0m). Configure settings or place panels.', 'info');
     }
   };
 
@@ -259,10 +414,7 @@ export const Roof3DWorldView: React.FC = () => {
       if (mapInstance) {
         cropBlob = await getCroppedSatelliteSnippet(
           mapInstance,
-          points?.[0],
-          points?.[1],
-          points?.[2],
-          points?.[3]
+          points
         );
       } else {
         const mapCanvas = document.querySelector('.maplibregl-canvas') as HTMLCanvasElement | null;
@@ -289,19 +441,63 @@ export const Roof3DWorldView: React.FC = () => {
         }
       }
 
-      // Send clean cropped image snippet to FastAPI YOLOv8-seg backend
-      const result = await fetchRoofSegmentation(cropBlob, 47.6, 6.2);
+      let initialW = 12.0;
+      let initialL = 10.0;
+      if (points && points.length >= 3) {
+        const metrics = calculatePolygonMetrics(points);
+        initialW = metrics.width;
+        initialL = metrics.length;
+      } else if (baseWidth > 0 && baseLength > 0 && hasRoof) {
+        initialW = baseWidth;
+        initialL = baseLength;
+      }
 
-      const targetWidth = result.dimensions?.width || 47.6;
-      const targetLength = result.dimensions?.length || 6.2;
+      // Send clean cropped image snippet to FastAPI YOLOv8-seg backend
+      const result = await fetchRoofSegmentation(cropBlob, initialW, initialL, points);
+
+      const targetWidth = result.dimensions?.width || initialW;
+      const targetLength = result.dimensions?.length || initialL;
+      const finalPts = points || result.polygon_points || [];
+
+      const roofData = {
+        id: `roof-ai-${Date.now()}`,
+        roofType: result.roof_type,
+        confidence: result.confidence,
+        polygonCoordinates: finalPts,
+        widthMeters: targetWidth,
+        lengthMeters: targetLength,
+        areaSqm: Number((targetWidth * targetLength).toFixed(1)),
+        pitchDeg: 15,
+        feature: {
+          type: 'Feature' as const,
+          properties: {
+            roofType: result.roof_type,
+            widthMeters: targetWidth,
+            lengthMeters: targetLength,
+            areaSqm: targetWidth * targetLength,
+          },
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [finalPts.length > 0 ? [...finalPts, finalPts[0]] : []],
+          },
+        },
+      };
+
+      if (setSelectedRoofData) {
+        setSelectedRoofData(roofData);
+      }
 
       setRoofStyle(result.roof_type);
+      setPolygonPoints(finalPts.length > 0 ? finalPts : undefined);
       setAiConfidence(result.confidence);
       setAiDetectedType(result.roof_type);
       setBaseWidth(targetWidth);
       setBaseLength(targetLength);
       setHasRoof(true);
       setAutoEnabled(true);
+      if (result.detected_trees && result.detected_trees.length > 0) {
+        setTrees(result.detected_trees);
+      }
 
       if (addToast) {
         addToast(
@@ -312,6 +508,9 @@ export const Roof3DWorldView: React.FC = () => {
       }
 
       // Automatically switch from Map View to 3D View upon receiving response
+      if (setActiveTab) {
+        setActiveTab('3d');
+      }
       setActiveViewMode('3d');
     } catch (err: any) {
       const msg = err?.message || 'Failed to detect roof geometry via AI.';
@@ -377,7 +576,10 @@ export const Roof3DWorldView: React.FC = () => {
           {/* Mode Toggles: "3D Roof View" vs "Map View" */}
           <div className="flex bg-[#F4F5F7] p-1 rounded-full border border-slate-200/80 text-xs font-medium shadow-xs">
             <button
-              onClick={() => setActiveViewMode('3d')}
+              onClick={() => {
+                setActiveViewMode('3d');
+                if (setActiveTab) setActiveTab('3d');
+              }}
               className={`px-4 py-1.5 rounded-full flex items-center gap-1.5 transition cursor-pointer ${
                 activeViewMode === '3d'
                   ? 'bg-white text-slate-900 font-semibold shadow-xs'
@@ -388,7 +590,10 @@ export const Roof3DWorldView: React.FC = () => {
               3D Roof View
             </button>
             <button
-              onClick={() => setActiveViewMode('map')}
+              onClick={() => {
+                setActiveViewMode('map');
+                if (setActiveTab) setActiveTab('map');
+              }}
               className={`px-4 py-1.5 rounded-full flex items-center gap-1.5 transition cursor-pointer ${
                 activeViewMode === 'map'
                   ? 'bg-white text-slate-900 font-semibold shadow-xs'
@@ -397,6 +602,17 @@ export const Roof3DWorldView: React.FC = () => {
             >
               <Compass className="w-3.5 h-3.5 text-slate-600" />
               Map View
+            </button>
+            <button
+              onClick={() => setActiveViewMode('spatial')}
+              className={`px-4 py-1.5 rounded-full flex items-center gap-1.5 transition cursor-pointer ${
+                activeViewMode === 'spatial'
+                  ? 'bg-blue-600 text-white font-semibold shadow-xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+              Spatial AI Studio
             </button>
           </div>
         </div>
@@ -541,539 +757,682 @@ export const Roof3DWorldView: React.FC = () => {
       </header>
 
       {/* ---------------- 2. MAIN WORKSPACE CONTAINER ---------------- */}
-      <div className="flex-1 min-h-0 w-full flex flex-row overflow-hidden relative">
-        {/* VIEW 1: 3D ROOF VIEW */}
-        {activeViewMode === '3d' ? (
-          <div className="flex-1 min-h-0 w-full h-full relative bg-[#F4F5F7]">
-            <Canvas
-              shadows
-              camera={{ position: [14, 12, 16], fov: 45 }}
-              className="w-full h-full cursor-grab active:cursor-grabbing"
-            >
-              {/* Sky Dome */}
-              <SkyEnvironment3D season={sunlightLevel === 'HIGH' ? 'DRY' : 'WET'} />
+      <div className="flex-1 min-h-0 w-full overflow-hidden relative">
+        {/* VIEW 0: SPATIAL AI STUDIO */}
+        {activeViewMode === 'spatial' ? (
+          <div className="w-full h-full relative">
+            <HeliosRoofEngine
+              onRoofSelected={(roof) => {
+                setRoofStyle(roof.roofType);
+                setPolygonPoints(roof.polygonCoords);
+                setPitchDeg(roof.pitchDeg);
+              }}
+              onMeshGenerated={(meshRes) => {
+                setBaseWidth(meshRes.metrics.width);
+                setBaseLength(meshRes.metrics.length);
+                setPolygonPoints(meshRes.localPoints?.map((p: any) => [p.x, p.z]));
+                setHasRoof(true);
+              }}
+            />
+          </div>
+        ) : activeViewMode === '3d' ? (
+          <div className="w-full h-full grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 box-border overflow-y-auto lg:overflow-hidden">
+            {/* 3D WebGL Viewport Canvas */}
+            <div className="col-span-1 lg:col-span-8 h-[60vh] lg:h-[80vh] min-h-[420px] relative overflow-hidden rounded-2xl bg-[#090d16] border border-slate-200/60 shadow-xs">
+              <Canvas
+                shadows
+                camera={{ position: [14, 12, 16], fov: 45 }}
+                className="w-full h-full cursor-grab active:cursor-grabbing"
+              >
+                {/* Sky Dome */}
+                <SkyEnvironment3D season={sunlightLevel === 'HIGH' ? 'DRY' : 'WET'} />
 
-              {/* Digos Ground Coordinate Plane */}
-              <DigosGroundPlane
-                isPerimeterMode={isPerimeterMode}
-                perimeterPoints={perimeterPoints}
-                onAddPoint={(pt) => setPerimeterPoints((prev) => [...prev, pt])}
-                onClearPoints={() => setPerimeterPoints([])}
-              />
+                {/* Digos Ground Coordinate Plane */}
+                <DigosGroundPlane
+                  isPerimeterMode={isPerimeterMode}
+                  perimeterPoints={perimeterPoints}
+                  onAddPoint={(pt) => setPerimeterPoints((prev) => [...prev, pt])}
+                  onClearPoints={() => setPerimeterPoints([])}
+                />
 
-              {/* Floating 3D Roof Mesh (Renders ONLY when hasRoof === true) */}
-              {hasRoof && (
-                <Bounds fit clip observe margin={1.2}>
-                  <House3DEngine
-                    hasRoof={hasRoof}
-                    roofStyle={roofStyle}
-                    width={baseWidth}
-                    depth={baseLength}
-                    elevation={3.8}
-                    pitchDeg={pitchDeg}
-                    layoutMode={panelLayoutMode}
-                    autoEnabled={autoEnabled}
-                    rows={rows}
-                    cols={cols}
-                    manualPanels={manualPanels}
-                    onAddManualPanel={handleAddManualPanel}
-                    onRemoveManualPanel={handleRemoveManualPanel}
-                    isLandscape={isLandscape}
-                    moduleLength={selectedModule.length}
-                    moduleWidth={selectedModule.width}
-                    moduleWattage={selectedModule.wattage}
-                    moduleLabel={`${selectedModule.brand} ${selectedModule.model}`}
-                  />
-                </Bounds>
-              )}
-
-              <OrbitControls
-                makeDefault
-                maxPolarAngle={Math.PI / 2 - 0.05}
-                minDistance={3}
-                maxDistance={120}
-              />
-            </Canvas>
-
-            {/* Empty Start State Guidance Overlay (when no roof drawn) */}
-            {!hasRoof && (
-              <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none p-6">
-                <div className="bg-white/95 backdrop-blur-md rounded-3xl border border-slate-100 p-8 shadow-xl max-w-md text-center pointer-events-auto space-y-4">
-                  <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto border border-emerald-100 shadow-xs">
-                    <Compass className="w-6 h-6" />
-                  </div>
-                  <div>
-                    <h3 className="text-base font-bold text-slate-900">
-                      No Roof Outline Drawn Yet
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-1">
-                      Switch to Map View and tap 4 corners on a satellite roof image to extrude an accurate 3D model.
-                    </p>
-                  </div>
-                  <div className="flex flex-col sm:flex-row gap-2 pt-2">
-                    <button
-                      onClick={() => setActiveViewMode('map')}
-                      className="flex-1 py-2.5 px-4 rounded-full bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm transition flex items-center justify-center gap-2 cursor-pointer"
-                    >
-                      <Compass className="w-3.5 h-3.5" />
-                      <span>Draw Roof Outline on Map</span>
-                    </button>
-                    <button
-                      onClick={handleManualRoofInit}
-                      className="py-2.5 px-4 rounded-full bg-[#F4F5F7] hover:bg-slate-200 text-slate-700 text-xs font-semibold border border-slate-200 transition cursor-pointer"
-                    >
-                      Use Default 8×10m
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* ---------------- FLOATING LIGHT NEUMORPHIC TELEMETRY CARD ---------------- */}
-            <div className="absolute top-6 left-6 z-20 pointer-events-none flex flex-col gap-3">
-              <div className="pointer-events-auto bg-white/95 backdrop-blur-md rounded-3xl border border-slate-100 p-5 shadow-sm max-w-sm space-y-3.5 text-slate-900">
-                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-                  <div className="flex items-center gap-2">
-                    <span className={`w-2.5 h-2.5 rounded-full ${hasRoof ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
-                    <span className="font-bold text-xs uppercase tracking-wider text-slate-900">
-                      SOLAR SYSTEM DETAILS
-                    </span>
-                  </div>
-                  <span className="bg-emerald-50 text-emerald-600 font-semibold px-2.5 py-0.5 rounded-full text-[10px] border border-emerald-100 truncate max-w-[140px]">
-                    {selectedModule.wattage}W • {selectedModule.model}
-                  </span>
-                </div>
-
-                {/* AI Detection Telemetry Badge */}
-                {aiConfidence !== null && (
-                  <div className="bg-emerald-50/90 border border-emerald-200 text-emerald-800 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center justify-between">
-                    <span className="flex items-center gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                      <span>AI Model: YOLOv8-seg</span>
-                    </span>
-                    <span className="uppercase font-mono text-emerald-700 bg-white px-2 py-0.5 rounded-md border border-emerald-200 shadow-2xs">
-                      {roofStyle} ({(aiConfidence * 100).toFixed(0)}%)
-                    </span>
-                  </div>
+                {/* Floating 3D Roof Mesh (Renders ONLY when hasRoof === true) */}
+                {hasRoof && (
+                  <Bounds fit clip observe margin={1.2}>
+                    <House3DEngine
+                      hasRoof={hasRoof}
+                      roofStyle={roofStyle}
+                      polygonPoints={polygonPoints}
+                      width={baseWidth}
+                      depth={baseLength}
+                      elevation={3.8}
+                      pitchDeg={pitchDeg}
+                      layoutMode={panelLayoutMode}
+                      autoEnabled={autoEnabled}
+                      rows={rows}
+                      cols={cols}
+                      manualPanels={manualPanels}
+                      onAddManualPanel={handleAddManualPanel}
+                      onRemoveManualPanel={handleRemoveManualPanel}
+                      isLandscape={isLandscape}
+                      moduleLength={selectedModule.length}
+                      moduleWidth={selectedModule.width}
+                      moduleWattage={selectedModule.wattage}
+                      moduleLabel={`${selectedModule.brand} ${selectedModule.model}`}
+                      trees={trees}
+                      neighborContextRoofs={contextRoofs}
+                      onObstructionStats={setObstructionStats}
+                    />
+                  </Bounds>
                 )}
 
-                {/* 2x2 Metric Grid (STRICTLY 0 WHEN NO ROOF DRAWN) */}
-                <div className="grid grid-cols-2 gap-2.5">
-                  {/* Metric 1: TOTAL ROOF SIZE */}
-                  <div className="bg-[#F4F5F7] p-3 rounded-2xl border border-slate-200/60">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 block mb-0.5">
-                      TOTAL ROOF SIZE
+                <OrbitControls
+                  makeDefault
+                  maxPolarAngle={Math.PI / 2 - 0.05}
+                  minDistance={3}
+                  maxDistance={120}
+                />
+              </Canvas>
+
+              {/* ---------------- FIXED TOP-RIGHT TELEMETRY BADGE OVERLAY ---------------- */}
+              {hasRoof && (
+                <div className="absolute top-4 right-4 z-20 bg-white/95 backdrop-blur-md p-4 rounded-2xl shadow-xl border border-slate-100 max-w-xs pointer-events-auto space-y-1.5 select-none">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-emerald-700 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                      {polygonPoints && polygonPoints.length >= 3
+                        ? `${polygonPoints.length}-Point Complex Roof (${effectivePitch}°)`
+                        : isFlat
+                        ? 'Flat Roof (0°)'
+                        : isHip
+                        ? `Hip Roof (${effectivePitch}°)`
+                        : isMono
+                        ? `Mono-Slope (${effectivePitch}°)`
+                        : `Gable Roof (${effectivePitch}°)`}
                     </span>
-                    <div className="flex items-baseline gap-1">
-                      <span className="text-xl font-bold font-mono text-slate-900">
-                        {hasRoof ? trueSlopedArea.toFixed(1) : '0.0'}
-                      </span>
-                      <span className="text-xs font-mono text-slate-500">m²</span>
-                    </div>
-                    <span className="text-[9px] font-mono text-slate-400">
-                      {hasRoof ? `Flat: ${flatBaseArea.toFixed(0)}m² (${pitchDeg}°)` : 'No roof drawn'}
+                    <span className="text-[10px] font-mono bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full font-bold border border-emerald-100">
+                      {trueSlopedArea.toFixed(1)} m²
                     </span>
                   </div>
-
-                  {/* Metric 2: NUMBER OF PANELS */}
-                  <div className="bg-[#F4F5F7] p-3 rounded-2xl border border-slate-200/60">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 block mb-0.5">
-                      NUMBER OF PANELS
-                    </span>
-                    <div className="flex items-baseline gap-1">
-                      <span className="text-xl font-bold font-mono text-emerald-600">
-                        {panelCount}
-                      </span>
-                      <span className="text-xs font-mono text-slate-500">panels</span>
-                    </div>
-                    <span className="text-[9px] font-mono text-slate-400">
-                      {panelLayoutMode === 'auto' && autoEnabled ? `${rows}×${cols} auto` : `${panelCount} placed`}
-                    </span>
-                  </div>
-
-                  {/* Metric 3: SYSTEM POWER SIZE */}
-                  <div className="bg-[#F4F5F7] p-3 rounded-2xl border border-slate-200/60">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 block mb-0.5">
-                      SYSTEM POWER SIZE
-                    </span>
-                    <div className="flex items-baseline gap-1">
-                      <span className="text-xl font-bold font-mono text-slate-900">
-                        {systemSizeKW.toFixed(2)}
-                      </span>
-                      <span className="text-xs font-mono text-slate-500">kW</span>
-                    </div>
-                    <span className="text-[9px] font-mono text-slate-400 truncate block">
-                      {panelCount} × {selectedModule.wattage}W ({selectedModule.brand})
-                    </span>
-                  </div>
-
-                  {/* Metric 4: POWER GENERATED PER DAY */}
-                  <div className="bg-[#F4F5F7] p-3 rounded-2xl border border-slate-200/60">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 block mb-0.5">
-                      POWER GENERATED PER DAY
-                    </span>
-                    <div className="flex items-baseline gap-1">
-                      <span className="text-xl font-bold font-mono text-emerald-600">
-                        {dailyYieldKwh.toFixed(1)}
-                      </span>
-                      <span className="text-xs font-mono text-slate-500">kWh/day</span>
-                    </div>
-                    <span className="text-[9px] font-mono text-slate-400">
-                      {peakSunHours} Sun Hours/day (4.5 PSH)
-                    </span>
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono pt-1 border-t border-slate-100">
+                    <span>{panelCount} Modules ({selectedModule.wattage}W)</span>
+                    <span className="font-bold text-slate-800">{baseWidth.toFixed(1)}m × {baseLength.toFixed(1)}m</span>
                   </div>
                 </div>
+              )}
 
-                {/* Daily Power Offset Bar */}
-                <div className="p-3 bg-emerald-50/80 border border-emerald-100 rounded-2xl flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Percent className="w-4 h-4 text-emerald-600 shrink-0" />
+              {/* Empty Start State Guidance Overlay (when no roof drawn) */}
+              {!hasRoof && !selectedRoofData && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none p-6">
+                  <div className="bg-white/95 backdrop-blur-md rounded-3xl border border-slate-100 p-8 shadow-xl max-w-md text-center pointer-events-auto space-y-4">
+                    <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto border border-emerald-100 shadow-xs">
+                      <Compass className="w-6 h-6" />
+                    </div>
                     <div>
-                      <span className="text-[11px] font-bold text-slate-800 block">
-                        Power Offset
+                      <h3 className="text-base font-bold text-slate-900">
+                        No Roof Outline Drawn Yet
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-1">
+                        Switch to Map View and tap a detected rooftop polygon or trace 4 corners on the satellite image to extrude an accurate 3D model.
+                      </p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2 pt-2">
+                      <button
+                        onClick={() => {
+                          setActiveViewMode('map');
+                          if (setActiveTab) setActiveTab('map');
+                        }}
+                        className="flex-1 py-2.5 px-4 rounded-full bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-sm transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Compass className="w-3.5 h-3.5" />
+                        <span>Draw Roof Outline on Map</span>
+                      </button>
+                      <button
+                        onClick={handleManualRoofInit}
+                        className="py-2.5 px-4 rounded-full bg-[#F4F5F7] hover:bg-slate-200 text-slate-700 text-xs font-semibold border border-slate-200 transition cursor-pointer"
+                      >
+                        Use Default 8×10m
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ---------------- FLOATING LIGHT NEUMORPHIC TELEMETRY CARD (TOP-LEFT) ---------------- */}
+              <div className="absolute top-4 left-4 z-20 pointer-events-none flex flex-col gap-3">
+                <div className="pointer-events-auto bg-white/95 backdrop-blur-md rounded-3xl border border-slate-100 p-4 sm:p-5 shadow-sm max-w-xs sm:max-w-sm space-y-3 text-slate-900">
+                  <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                    <div className="flex items-center gap-2">
+                      <span className={`w-2.5 h-2.5 rounded-full ${hasRoof ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
+                      <span className="font-bold text-xs uppercase tracking-wider text-slate-900">
+                        SOLAR SYSTEM DETAILS
                       </span>
-                      <span className="text-[9px] font-mono text-slate-500">
-                        Daily Power Used: {dailyNeedKwh} kWh/day
+                    </div>
+                    <span className="bg-emerald-50 text-emerald-600 font-semibold px-2 py-0.5 rounded-full text-[10px] border border-emerald-100 truncate max-w-[120px]">
+                      {selectedModule.wattage}W • {selectedModule.brand}
+                    </span>
+                  </div>
+
+                  {/* AI Detection Telemetry Badge */}
+                  {aiConfidence !== null && (
+                    <div className="bg-emerald-50/90 border border-emerald-200 text-emerald-800 text-[10px] font-bold px-3 py-1.5 rounded-xl flex items-center justify-between">
+                      <span className="flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        <span>AI: YOLOv8 (512x512 TTA)</span>
+                      </span>
+                      <span className="uppercase font-mono text-emerald-700 bg-white px-2 py-0.5 rounded-md border border-emerald-200 shadow-2xs">
+                        {roofStyle} Roof ({(aiConfidence * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                  )}
+
+                  {/* 2x2 Metric Grid (STRICTLY 0 WHEN NO ROOF DRAWN) */}
+                  <div className="grid grid-cols-2 gap-2">
+                    {/* Metric 1: TOTAL ROOF SIZE */}
+                    <div className="bg-[#F4F5F7] p-2.5 rounded-2xl border border-slate-200/60">
+                      <span className="text-[9px] uppercase font-bold text-slate-500 block mb-0.5">
+                        TOTAL ROOF SIZE
+                      </span>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-lg font-bold font-mono text-slate-900">
+                          {hasRoof ? trueSlopedArea.toFixed(1) : '0.0'}
+                        </span>
+                        <span className="text-xs font-mono text-slate-500">m²</span>
+                      </div>
+                      <span className="text-[9px] font-mono text-slate-400">
+                        {hasRoof ? `Flat: ${flatBaseArea.toFixed(0)}m² (${pitchDeg}°)` : 'No roof drawn'}
+                      </span>
+                    </div>
+
+                    {/* Metric 2: NUMBER OF PANELS */}
+                    <div className="bg-[#F4F5F7] p-2.5 rounded-2xl border border-slate-200/60">
+                      <span className="text-[9px] uppercase font-bold text-slate-500 block mb-0.5">
+                        NUMBER OF PANELS
+                      </span>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-lg font-bold font-mono text-emerald-600">
+                          {panelCount}
+                        </span>
+                        <span className="text-xs font-mono text-slate-500">panels</span>
+                      </div>
+                      <span className="text-[9px] font-mono text-slate-400">
+                        {panelLayoutMode === 'auto' && autoEnabled ? `${rows}×${cols} auto` : `${panelCount} placed`}
+                      </span>
+                    </div>
+
+                    {/* Metric 3: SYSTEM POWER SIZE */}
+                    <div className="bg-[#F4F5F7] p-2.5 rounded-2xl border border-slate-200/60">
+                      <span className="text-[9px] uppercase font-bold text-slate-500 block mb-0.5">
+                        SYSTEM POWER SIZE
+                      </span>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-lg font-bold font-mono text-slate-900">
+                          {systemSizeKW.toFixed(2)}
+                        </span>
+                        <span className="text-xs font-mono text-slate-500">kW</span>
+                      </div>
+                      <span className="text-[9px] font-mono text-slate-400 truncate block">
+                        {panelCount} × {selectedModule.wattage}W
+                      </span>
+                    </div>
+
+                    {/* Metric 4: POWER GENERATED PER DAY */}
+                    <div className="bg-[#F4F5F7] p-2.5 rounded-2xl border border-slate-200/60">
+                      <span className="text-[9px] uppercase font-bold text-slate-500 block mb-0.5">
+                        POWER GENERATED / DAY
+                      </span>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-lg font-bold font-mono text-emerald-600">
+                          {dailyYieldKwh.toFixed(1)}
+                        </span>
+                        <span className="text-xs font-mono text-slate-500">kWh/d</span>
+                      </div>
+                      <span className="text-[9px] font-mono text-slate-400">
+                        {peakSunHours} Sun Hours (PSH)
                       </span>
                     </div>
                   </div>
-                  <span className="text-lg font-bold font-mono text-emerald-700">
-                    {powerOffsetPct.toFixed(0)}%
-                  </span>
+
+                  {/* Daily Power Offset Bar */}
+                  <div className="p-2.5 bg-emerald-50/80 border border-emerald-100 rounded-2xl flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Percent className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <div>
+                        <span className="text-[10px] font-bold text-slate-800 block leading-tight">
+                          Power Offset
+                        </span>
+                        <span className="text-[9px] font-mono text-slate-500">
+                          Need: {dailyNeedKwh} kWh/day
+                        </span>
+                      </div>
+                    </div>
+                    <span className="text-base font-bold font-mono text-emerald-700">
+                      {powerOffsetPct.toFixed(0)}%
+                    </span>
+                  </div>
+
+                  {/* Shading / Obstruction Warning Banner */}
+                  {obstructionStats.obstructed > 0 && (
+                    <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-2 text-rose-800 text-xs">
+                      <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping shrink-0" />
+                      <div className="text-[10px] font-semibold leading-tight">
+                        <span className="font-bold">{obstructionStats.obstructed} module(s) shaded/invalid</span>
+                        <span className="block text-rose-600 text-[9px] font-normal">
+                          Excluded from system size & yield calculations for safety.
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
+
+            {/* ---------------- 3. ROOF & PANEL SETTINGS SIDEBAR ---------------- */}
+            <aside className="col-span-1 lg:col-span-4 h-auto lg:h-[80vh] max-h-[80vh] overflow-y-auto pr-2 flex flex-col bg-white border border-slate-200/60 rounded-2xl shadow-xs">
+              {/* Sidebar Header */}
+              <div className="shrink-0 p-4 border-b border-slate-100 flex items-center justify-between bg-white rounded-t-2xl">
+                <div className="flex items-center gap-2">
+                  <Cpu className="w-4 h-4 text-emerald-600" />
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-900">
+                    ROOF & PANEL SETTINGS
+                  </h2>
+                </div>
+                <span className="bg-emerald-50 text-emerald-700 font-semibold px-2.5 py-0.5 rounded-full text-[10px] border border-emerald-100">
+                  DIGOS CITY
+                </span>
+              </div>
+
+              {/* Interactive Sliders & Geometries */}
+              <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+                {/* Quick Switch to Map View */}
+                <button
+                  onClick={() => setActiveViewMode('map')}
+                  className="w-full py-2.5 px-4 rounded-full bg-[#F4F5F7] hover:bg-slate-200/80 text-slate-700 border border-slate-200 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer"
+                >
+                  <Compass className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Open Map View</span>
+                </button>
+
+                {/* ---------------- 0. TREE OVERHANG & URBAN ISOLATION TOGGLE ---------------- */}
+                <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
+                      Urban Context & Trees
+                    </label>
+                    <span className="text-[9px] font-mono text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded font-bold">
+                      {trees.length} Tree(s) • {contextRoofs.length} Context Roofs
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <button
+                      onClick={() => {
+                        if (trees.length > 0) {
+                          setTrees([]);
+                          if (addToast) addToast('Removed procedural perimeter trees.', 'info');
+                        } else {
+                          setTrees([
+                            {
+                              id: 'perimeter-tree-1',
+                              x: -baseWidth / 2 - 1.5,
+                              z: -baseLength / 4,
+                              heightMeters: 7.2,
+                              canopyRadius: 3.5,
+                              trunkRadius: 0.35,
+                              species: 'mango',
+                            },
+                          ]);
+                          if (addToast) addToast('Spawned 3D perimeter tree casting real-time shadows.', 'success');
+                        }
+                      }}
+                      className={`py-2 px-3 rounded-full text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer ${
+                        trees.length > 0
+                          ? 'bg-emerald-600 text-white shadow-xs'
+                          : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span>🌲 {trees.length > 0 ? 'Hide Trees' : 'Spawn Tree'}</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (contextRoofs.length > 0) {
+                          setContextRoofs([]);
+                          if (addToast) addToast('Hidden context neighbor roofs.', 'info');
+                        } else {
+                          setContextRoofs([
+                            {
+                              id: 'neighbor-north',
+                              polygon: [
+                                { x: -baseWidth / 2, z: -baseLength / 2 - 6 },
+                                { x: baseWidth / 2, z: -baseLength / 2 - 6 },
+                                { x: baseWidth / 2, z: -baseLength / 2 - 2 },
+                                { x: -baseWidth / 2, z: -baseLength / 2 - 2 },
+                              ],
+                              heightMeters: 3.8,
+                            },
+                            {
+                              id: 'neighbor-east',
+                              polygon: [
+                                { x: baseWidth / 2 + 2, z: -baseLength / 2 },
+                                { x: baseWidth / 2 + 8, z: -baseLength / 2 },
+                                { x: baseWidth / 2 + 8, z: baseLength / 2 },
+                                { x: baseWidth / 2 + 2, z: baseLength / 2 },
+                              ],
+                              heightMeters: 3.4,
+                            },
+                          ]);
+                          if (addToast) addToast('Isolated target roof with context neighbor buildings.', 'info');
+                        }
+                      }}
+                      className={`py-2 px-3 rounded-full text-[11px] font-bold transition flex items-center justify-center gap-1 cursor-pointer ${
+                        contextRoofs.length > 0
+                          ? 'bg-slate-900 text-white shadow-xs'
+                          : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span>🏢 {contextRoofs.length > 0 ? 'Hide Context' : 'Show Context'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* ---------------- 1. ROOF STYLE DROPDOWN (WITH AI / MANUAL OVERRIDE) ---------------- */}
+                <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
+                      Roof Style
+                    </label>
+                    {aiConfidence !== null && (
+                      <span className="text-[9px] font-mono text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
+                        AI: {aiDetectedType?.toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+                  <select
+                    value={roofStyle}
+                    onChange={(e) => setRoofStyle(e.target.value as RoofStyle)}
+                    className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
+                  >
+                    <option value="hip">Hip Roof (4-Slope Pyramid / Digos Residential)</option>
+                    <option value="gable">Gable Roof (2-Slope A-Frame)</option>
+                    <option value="complex">Complex L-Shaped Roof (Multi-Section)</option>
+                    <option value="flat">Flat Roof (Commercial / Concrete)</option>
+                    <option value="mono">Mono-Slope (Shed / Skillion)</option>
+                  </select>
+                </div>
+
+                {/* ---------------- 2. SOLAR MODULE BRAND DROPDOWN ---------------- */}
+                <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
+                      Solar Module Brand
+                    </label>
+                    <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                      {selectedModule.wattage}W
+                    </span>
+                  </div>
+                  <select
+                    value={selectedModuleId}
+                    onChange={(e) => {
+                      setSelectedModuleId(e.target.value);
+                      const mod = SOLAR_MODULE_PRESETS.find((m) => m.id === e.target.value);
+                      if (mod && addToast) {
+                        addToast(`Selected ${mod.brand} ${mod.model} (${mod.wattage}W)`, 'info');
+                      }
+                    }}
+                    className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
+                  >
+                    {SOLAR_MODULE_PRESETS.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  {/* Module Physical Footprint Dimensions Pill */}
+                  <div className="bg-white/90 border border-slate-200/80 rounded-xl px-3 py-2 flex items-center justify-between text-[11px] text-slate-600">
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span className="font-semibold text-slate-800">{selectedModule.brand}</span>
+                    </div>
+                    <div className="font-mono text-emerald-700 font-bold">
+                      {selectedModule.length}m × {selectedModule.width}m (1:1 scale)
+                    </div>
+                  </div>
+                </div>
+
+                {/* ---------------- 3. PANEL LAYOUT MODE DROPDOWN ---------------- */}
+                <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-2">
+                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
+                    Panel Layout Mode
+                  </label>
+                  <select
+                    value={panelLayoutMode}
+                    onChange={(e) => {
+                      const mode = e.target.value as 'auto' | 'manual';
+                      setPanelLayoutMode(mode);
+                      if (mode === 'auto') {
+                        setAutoEnabled(true);
+                      }
+                    }}
+                    className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
+                  >
+                    <option value="auto">Auto-Grid Fill</option>
+                    <option value="manual">Manual Click Placement</option>
+                  </select>
+
+                  {panelLayoutMode === 'manual' ? (
+                    <p className="text-[11px] text-emerald-800 bg-emerald-50 p-2 rounded-xl border border-emerald-100">
+                      💡 Click directly on the 3D roof plane to place a panel. Click a placed panel to remove it.
+                    </p>
+                  ) : (
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={() => setAutoEnabled(true)}
+                        className={`flex-1 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer ${
+                          autoEnabled
+                            ? 'bg-emerald-600 text-white shadow-xs'
+                            : 'bg-white text-slate-700 border border-slate-200'
+                        }`}
+                      >
+                        Fill Roof Grid
+                      </button>
+                      <button
+                        onClick={handleClearAllPanels}
+                        className="py-1.5 px-3 rounded-full bg-white text-slate-600 hover:text-rose-600 border border-slate-200 text-xs font-semibold transition cursor-pointer"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* ---------------- SLIDERS CONTAINER ---------------- */}
+                <div className="space-y-4 pt-1">
+                  {/* Roof Pitch Angle */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Roof Pitch Angle</label>
+                      <span className="font-mono text-emerald-600 font-bold">
+                        {isFlat ? '0° (Flat)' : `${effectivePitch}°`}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={45}
+                      step={1}
+                      value={effectivePitch}
+                      disabled={isFlat}
+                      onChange={(e) => setPitchDeg(Number(e.target.value))}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
+                    />
+                    <div className="flex justify-between text-[10px] font-mono text-slate-400">
+                      <span>Flat (0°)</span>
+                      <span className="text-emerald-700 font-semibold">15° Standard GI</span>
+                      <span>Steep (45°)</span>
+                    </div>
+                  </div>
+
+                  {/* Roof Width */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Roof Width</label>
+                      <span className="font-mono text-slate-900 font-bold">{baseWidth.toFixed(1)} m</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1.0"
+                      max="100.0"
+                      step="0.1"
+                      value={baseWidth}
+                      onChange={(e) => {
+                        const val = Math.max(1.0, Math.min(100.0, Number(e.target.value)));
+                        setBaseWidth(val);
+                        if (val > 0 && baseLength > 0) setHasRoof(true);
+                      }}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+
+                  {/* Roof Length */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Roof Length</label>
+                      <span className="font-mono text-slate-900 font-bold">{baseLength.toFixed(1)} m</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1.0"
+                      max="100.0"
+                      step="0.1"
+                      value={baseLength}
+                      onChange={(e) => {
+                        const val = Math.max(1.0, Math.min(100.0, Number(e.target.value)));
+                        setBaseLength(val);
+                        if (val > 0 && baseWidth > 0) setHasRoof(true);
+                      }}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+
+                  {/* Panel Rows */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Panel Rows</label>
+                      <span className="font-mono text-emerald-600 font-bold">{rows} Rows</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="20"
+                      step="1"
+                      value={rows}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.min(20, Number(e.target.value)));
+                        setRows(val);
+                        if (panelLayoutMode === 'auto' && val > 0 && cols > 0) setAutoEnabled(true);
+                      }}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+
+                  {/* Panel Columns */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Panel Columns</label>
+                      <span className="font-mono text-emerald-600 font-bold">{cols} Columns</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="20"
+                      step="1"
+                      value={cols}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.min(20, Number(e.target.value)));
+                        setCols(val);
+                        if (panelLayoutMode === 'auto' && val > 0 && rows > 0) setAutoEnabled(true);
+                      }}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+
+                  {/* Panel Position */}
+                  <div className="flex items-center justify-between pt-1">
+                    <span className="text-xs text-slate-700 font-medium">Panel Position</span>
+                    <button
+                      onClick={() => setIsLandscape(!isLandscape)}
+                      className="px-3 py-1.5 rounded-full bg-[#F4F5F7] border border-slate-200 text-xs font-mono text-slate-800 hover:border-emerald-500 transition cursor-pointer shadow-xs"
+                    >
+                      {isLandscape
+                        ? `Landscape (${selectedModule.width}m × ${selectedModule.length}m)`
+                        : `Portrait (${selectedModule.length}m × ${selectedModule.width}m)`}
+                    </button>
+                  </div>
+
+                  {/* Daily Power Used */}
+                  <div className="space-y-1.5 pt-2 border-t border-slate-100">
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+                      <label>Daily Power Used</label>
+                      <span className="font-mono text-emerald-600 font-bold">
+                        {dailyNeedKwh} kWh/day
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={5}
+                      max={100}
+                      step={1}
+                      value={dailyNeedKwh}
+                      onChange={(e) => setDailyNeedKwh(Number(e.target.value))}
+                      className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+
+                  {/* Clear All Panels Button */}
+                  <div className="pt-2">
+                    <button
+                      onClick={handleClearAllPanels}
+                      className="w-full py-2 px-4 rounded-full bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 border border-slate-200 hover:border-rose-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Clear All Panels</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Technical Context Info */}
+                <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-1 text-[11px] text-slate-600 font-medium">
+                  <div className="flex items-center gap-1.5 text-slate-800 font-bold text-xs mb-1">
+                    <Info className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Solar Info</span>
+                  </div>
+                  <p>• Standard GI corrugated roofs use a 15° pitch.</p>
+                  <p>• Digos City solar power: 4.5 – 5.1 kWh/day per kW.</p>
+                  <p>
+                    • Active Module: {selectedModule.brand} {selectedModule.model} ({selectedModule.wattage}W, {selectedModule.length}m × {selectedModule.width}m).
+                  </p>
+                </div>
+              </div>
+
+              {/* Sidebar Footer */}
+              <div className="shrink-0 p-3 border-t border-slate-100 bg-white text-center rounded-b-2xl">
+                <p className="text-[10px] font-mono text-slate-400">
+                  Helios Solar Platform • Digos City, Davao del Sur
+                </p>
+              </div>
+            </aside>
           </div>
         ) : (
           /* VIEW 2: MAPLIBRE SATELLITE (FULL SCREEN - 100% WIDTH) */
-          <div className="flex-1 min-h-0 w-full h-full relative">
-            <MapEngineView
-              onRoofCaptured={handleRoofCaptured}
-              activeBarangay={activeCustomer.barangay}
-              onAiAutoDetectFromMap={(mapInst, pts) => handleAiAutoDetect(mapInst, pts)}
-              isAnalyzing={isAnalyzing}
-            />
+          <div className="flex-1 min-h-0 w-full h-full relative p-4 box-border">
+            <div className="w-full h-full rounded-2xl overflow-hidden border border-slate-200/60 shadow-xs relative">
+              <MapEngineView
+                onRoofCaptured={handleRoofCaptured}
+                activeBarangay={activeCustomer.barangay}
+                onAiAutoDetectFromMap={(mapInst, pts) => handleAiAutoDetect(mapInst, pts)}
+                isAnalyzing={isAnalyzing}
+              />
+            </div>
           </div>
-        )}
-
-        {/* 
-          ---------------- 3. ROOF & PANEL SETTINGS SIDEBAR ----------------
-          CONDITIONAL RENDERING:
-          SHOW when activeViewMode === '3d'
-          COMPLETELY HIDE when activeViewMode === 'map' so the satellite map expands to 100% full width!
-        */}
-        {activeViewMode === '3d' && (
-          <aside className="w-80 shrink-0 h-full overflow-hidden flex flex-col bg-white border-l border-slate-100 shadow-sm">
-            {/* Sidebar Header */}
-            <div className="shrink-0 p-4 border-b border-slate-100 flex items-center justify-between bg-white">
-              <div className="flex items-center gap-2">
-                <Cpu className="w-4 h-4 text-emerald-600" />
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-900">
-                  ROOF & PANEL SETTINGS
-                </h2>
-              </div>
-              <span className="bg-emerald-50 text-emerald-700 font-semibold px-2.5 py-0.5 rounded-full text-[10px] border border-emerald-100">
-                DIGOS CITY
-              </span>
-            </div>
-
-            {/* Interactive Sliders & Geometries */}
-            <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-              {/* Quick Switch to Map View */}
-              <button
-                onClick={() => setActiveViewMode('map')}
-                className="w-full py-2.5 px-4 rounded-full bg-[#F4F5F7] hover:bg-slate-200/80 text-slate-700 border border-slate-200 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer"
-              >
-                <Compass className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Open Map View</span>
-              </button>
-
-              {/* ---------------- 1. ROOF STYLE DROPDOWN (WITH AI / MANUAL OVERRIDE) ---------------- */}
-              <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
-                    Roof Style
-                  </label>
-                  {aiConfidence !== null && (
-                    <span className="text-[9px] font-mono text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
-                      AI: {aiDetectedType?.toUpperCase()}
-                    </span>
-                  )}
-                </div>
-                <select
-                  value={roofStyle}
-                  onChange={(e) => setRoofStyle(e.target.value as RoofStyle)}
-                  className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
-                >
-                  <option value="gable">Gable Roof (Default)</option>
-                  <option value="flat">Flat Roof</option>
-                  <option value="hip">Hip Roof (4-Slope)</option>
-                  <option value="mono">Mono-Slope (Shed)</option>
-                </select>
-              </div>
-
-              {/* ---------------- 2. SOLAR MODULE BRAND DROPDOWN ---------------- */}
-              <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
-                    Solar Module Brand
-                  </label>
-                  <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                    {selectedModule.wattage}W
-                  </span>
-                </div>
-                <select
-                  value={selectedModuleId}
-                  onChange={(e) => {
-                    setSelectedModuleId(e.target.value);
-                    const mod = SOLAR_MODULE_PRESETS.find((m) => m.id === e.target.value);
-                    if (mod && addToast) {
-                      addToast(`Selected ${mod.brand} ${mod.model} (${mod.wattage}W)`, 'info');
-                    }
-                  }}
-                  className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
-                >
-                  {SOLAR_MODULE_PRESETS.map((preset) => (
-                    <option key={preset.id} value={preset.id}>
-                      {preset.name}
-                    </option>
-                  ))}
-                </select>
-
-                {/* Module Physical Footprint Dimensions Pill */}
-                <div className="bg-white/90 border border-slate-200/80 rounded-xl px-3 py-2 flex items-center justify-between text-[11px] text-slate-600">
-                  <div className="flex items-center gap-1.5 font-medium">
-                    <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                    <span className="font-semibold text-slate-800">{selectedModule.brand}</span>
-                  </div>
-                  <div className="font-mono text-emerald-700 font-bold">
-                    {selectedModule.length}m × {selectedModule.width}m (1:1 scale)
-                  </div>
-                </div>
-              </div>
-
-              {/* ---------------- 3. PANEL LAYOUT MODE DROPDOWN ---------------- */}
-              <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-2">
-                <label className="block text-xs font-bold uppercase tracking-wider text-slate-900">
-                  Panel Layout Mode
-                </label>
-                <select
-                  value={panelLayoutMode}
-                  onChange={(e) => {
-                    const mode = e.target.value as 'auto' | 'manual';
-                    setPanelLayoutMode(mode);
-                    if (mode === 'auto') {
-                      setAutoEnabled(true);
-                    }
-                  }}
-                  className="w-full rounded-full bg-white border border-slate-200 px-3.5 py-2.5 text-xs font-semibold text-slate-900 focus:outline-none focus:border-emerald-500 shadow-xs cursor-pointer"
-                >
-                  <option value="auto">Auto-Grid Fill</option>
-                  <option value="manual">Manual Click Placement</option>
-                </select>
-
-                {panelLayoutMode === 'manual' ? (
-                  <p className="text-[11px] text-emerald-800 bg-emerald-50 p-2 rounded-xl border border-emerald-100">
-                    💡 Click directly on the 3D roof plane to place a panel. Click a placed panel to remove it.
-                  </p>
-                ) : (
-                  <div className="flex gap-2 pt-1">
-                    <button
-                      onClick={() => setAutoEnabled(true)}
-                      className={`flex-1 py-1.5 rounded-full text-xs font-semibold transition cursor-pointer ${
-                        autoEnabled
-                          ? 'bg-emerald-600 text-white shadow-xs'
-                          : 'bg-white text-slate-700 border border-slate-200'
-                      }`}
-                    >
-                      Fill Roof Grid
-                    </button>
-                    <button
-                      onClick={handleClearAllPanels}
-                      className="py-1.5 px-3 rounded-full bg-white text-slate-600 hover:text-rose-600 border border-slate-200 text-xs font-semibold transition cursor-pointer"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* ---------------- SLIDERS CONTAINER ---------------- */}
-              <div className="space-y-4 pt-1">
-                {/* Roof Pitch Angle */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Roof Pitch Angle</label>
-                    <span className="font-mono text-emerald-600 font-bold">
-                      {isFlat ? '0° (Flat)' : `${effectivePitch}°`}
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={45}
-                    step={1}
-                    value={effectivePitch}
-                    disabled={isFlat}
-                    onChange={(e) => setPitchDeg(Number(e.target.value))}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500 disabled:opacity-40"
-                  />
-                  <div className="flex justify-between text-[10px] font-mono text-slate-400">
-                    <span>Flat (0°)</span>
-                    <span className="text-emerald-700 font-semibold">15° Standard GI</span>
-                    <span>Steep (45°)</span>
-                  </div>
-                </div>
-
-                {/* Roof Width */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Roof Width</label>
-                    <span className="font-mono text-slate-900 font-bold">{baseWidth.toFixed(1)} m</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="1.0"
-                    max="100.0"
-                    step="0.1"
-                    value={baseWidth}
-                    onChange={(e) => {
-                      const val = Math.max(1.0, Math.min(100.0, Number(e.target.value)));
-                      setBaseWidth(val);
-                      if (val > 0 && baseLength > 0) setHasRoof(true);
-                    }}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-
-                {/* Roof Length */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Roof Length</label>
-                    <span className="font-mono text-slate-900 font-bold">{baseLength.toFixed(1)} m</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="1.0"
-                    max="100.0"
-                    step="0.1"
-                    value={baseLength}
-                    onChange={(e) => {
-                      const val = Math.max(1.0, Math.min(100.0, Number(e.target.value)));
-                      setBaseLength(val);
-                      if (val > 0 && baseWidth > 0) setHasRoof(true);
-                    }}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-
-                {/* Panel Rows */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Panel Rows</label>
-                    <span className="font-mono text-emerald-600 font-bold">{rows} Rows</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="20"
-                    step="1"
-                    value={rows}
-                    onChange={(e) => {
-                      const val = Math.max(0, Math.min(20, Number(e.target.value)));
-                      setRows(val);
-                      if (panelLayoutMode === 'auto' && val > 0 && cols > 0) setAutoEnabled(true);
-                    }}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-
-                {/* Panel Columns */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Panel Columns</label>
-                    <span className="font-mono text-emerald-600 font-bold">{cols} Columns</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="20"
-                    step="1"
-                    value={cols}
-                    onChange={(e) => {
-                      const val = Math.max(0, Math.min(20, Number(e.target.value)));
-                      setCols(val);
-                      if (panelLayoutMode === 'auto' && val > 0 && rows > 0) setAutoEnabled(true);
-                    }}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-
-                {/* Panel Position */}
-                <div className="flex items-center justify-between pt-1">
-                  <span className="text-xs text-slate-700 font-medium">Panel Position</span>
-                  <button
-                    onClick={() => setIsLandscape(!isLandscape)}
-                    className="px-3 py-1.5 rounded-full bg-[#F4F5F7] border border-slate-200 text-xs font-mono text-slate-800 hover:border-emerald-500 transition cursor-pointer shadow-xs"
-                  >
-                    {isLandscape
-                      ? `Landscape (${selectedModule.width}m × ${selectedModule.length}m)`
-                      : `Portrait (${selectedModule.length}m × ${selectedModule.width}m)`}
-                  </button>
-                </div>
-
-                {/* Daily Power Used */}
-                <div className="space-y-1.5 pt-2 border-t border-slate-100">
-                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <label>Daily Power Used</label>
-                    <span className="font-mono text-emerald-600 font-bold">
-                      {dailyNeedKwh} kWh/day
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={5}
-                    max={100}
-                    step={1}
-                    value={dailyNeedKwh}
-                    onChange={(e) => setDailyNeedKwh(Number(e.target.value))}
-                    className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-
-                {/* Clear All Panels Button */}
-                <div className="pt-2">
-                  <button
-                    onClick={handleClearAllPanels}
-                    className="w-full py-2 px-4 rounded-full bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 border border-slate-200 hover:border-rose-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Clear All Panels</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Technical Context Info */}
-              <div className="p-3.5 bg-[#F4F5F7] border border-slate-200/60 rounded-2xl space-y-1 text-[11px] text-slate-600 font-medium">
-                <div className="flex items-center gap-1.5 text-slate-800 font-bold text-xs mb-1">
-                  <Info className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Solar Info</span>
-                </div>
-                <p>• Standard GI corrugated roofs use a 15° pitch.</p>
-                <p>• Digos City solar power: 4.5 – 5.1 kWh/day per kW.</p>
-                <p>
-                  • Active Module: {selectedModule.brand} {selectedModule.model} ({selectedModule.wattage}W, {selectedModule.length}m × {selectedModule.width}m).
-                </p>
-              </div>
-            </div>
-
-            {/* Sidebar Footer */}
-            <div className="shrink-0 p-3 border-t border-slate-100 bg-white text-center">
-              <p className="text-[10px] font-mono text-slate-400">
-                Helios Solar Platform • Digos City, Davao del Sur
-              </p>
-            </div>
-          </aside>
         )}
       </div>
 

@@ -65,18 +65,6 @@ export const DigosGroundPlane: React.FC<DigosGroundPlaneProps> = ({
         position={[0, 0.01, 0]}
       />
 
-      {/* Digos City Geographic Marker Badge */}
-      <Html position={[-18, 0.1, -18]} transform rotation={[-Math.PI / 2, 0, 0]} scale={0.8}>
-        <div className="bg-white/95 border border-slate-200 text-slate-800 px-3.5 py-1.5 rounded-full text-xs font-semibold shadow-md flex items-center gap-2 select-none pointer-events-none">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-          </span>
-          <span className="font-bold text-emerald-700">DIGOS CITY</span>
-          <span className="text-slate-500 text-[10px] font-mono font-medium">6.7497° N, 125.3572° E</span>
-        </div>
-      </Html>
-
       {/* Interactive Perimeter Node Spheres */}
       {perimeterPoints.map((pt, idx) => (
         <group key={`p-node-${idx}`} position={[pt.x, 0.1, pt.z]}>

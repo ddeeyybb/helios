@@ -9,6 +9,8 @@ export function useSolarContext() {
             role: null,
             user: null,
             activeView: 'auth',
+            activeTab: '3d',
+            selectedRoofData: null,
             toasts: [],
             activeClient: null,
             clients: [],
@@ -19,7 +21,10 @@ export function useSolarContext() {
             login: () => { },
             handleLogout: () => { },
             addToast: () => { },
-            setActiveView: () => { }
+            setActiveView: () => { },
+            setActiveTab: () => { },
+            setSelectedRoofData: () => { },
+            selectRoofAndTransition: () => { }
         };
     }
     return context;
@@ -125,6 +130,14 @@ export function SolarProvider({ children }) {
         addToast('Signed out successfully', 'info');
     };
 
+    const [activeTab, setActiveTab] = useState('3d'); // '3d' | 'map'
+    const [selectedRoofData, setSelectedRoofData] = useState(null);
+
+    const selectRoofAndTransition = (roofData) => {
+        setSelectedRoofData(roofData);
+        setActiveTab('3d');
+    };
+
     const addToast = (message, type = 'info') => {
         const id = Date.now();
         setToasts(prev => [...prev, { id, message, type }]);
@@ -138,6 +151,11 @@ export function SolarProvider({ children }) {
         user,
         activeView,
         setActiveView,
+        activeTab,
+        setActiveTab,
+        selectedRoofData,
+        setSelectedRoofData,
+        selectRoofAndTransition,
         toasts,
         clients,
         setClients,
