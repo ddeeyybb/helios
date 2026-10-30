@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>MaxZoom Test</title>
+</head>
+<body>
+  <div id="output">Running test...</div>
+  <script>
+    window.initMap = async function() {
+      const output = document.getElementById('output');
+      try {
+        const { MaxZoomService } = await google.maps.importLibrary("maps");
+        const service = new MaxZoomService();
+        const coords = [
+          { name: 'User Screenshot Location', lat: 6.749923, lng: 125.355340 },
+          { name: 'Digos City Hall', lat: 6.7329, lng: 125.3415 },
+          { name: 'Digos Central Public Terminal', lat: 6.7497, lng: 125.3572 },
+          { name: 'Manila (for comparison)', lat: 14.5995, lng: 120.9842 }
+        ];
+
+        const results = [];
+        for (const pt of coords) {
+          const res = await new Promise(resolve => {
+            service.getMaxZoomAtLatLng(new google.maps.LatLng(pt.lat, pt.lng), (r) => resolve(r));
+          });
+          results.push({ name: pt.name, lat: pt.lat, lng: pt.lng, result: res });
+        }
+        output.innerText = JSON.stringify(results, null, 2);
+      } catch (e) {
+        output.innerText = 'Error: ' + e.message;
+      }
+    };
+  </script>
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCYehwonmZHdlT2d6aTTPcbJmRRCnDlrNs&v=weekly&callback=initMap&libraries=maps"></script>
+</body>
+</html>
