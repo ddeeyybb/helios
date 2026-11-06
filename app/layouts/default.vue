@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import AppSidebar from '~/components/layout/AppSidebar.vue'
-import AppHeader from '~/components/layout/AppHeader.vue'
 import InstallerHelpModal from '~/components/layout/InstallerHelpModal.vue'
 
 const isHelpModalOpen = ref(false)
@@ -14,8 +13,6 @@ const isHelpModalOpen = ref(false)
 
     <!-- Main Workspace Area -->
     <div class="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
-      <AppHeader />
-
       <main class="flex-1 overflow-y-auto">
         <slot />
       </main>

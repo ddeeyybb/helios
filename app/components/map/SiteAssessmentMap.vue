@@ -3,48 +3,43 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useSiteAssessment } from '~/composables/useSiteAssessment'
 import { useGoogleMaps } from '~/composables/useGoogleMaps'
 import { DIGOS_BOUNDS, DIGOS_CITY_CENTER, isInsideDigos } from '~/data/sampleProperties'
-import ObstructionModal from '~/components/site-assessment/ObstructionModal.vue'
-import type { RoofObstacle, PlacedSolarPanel } from '~/types/roof'
+import {
+  orderRoofPolygonVertices,
+  SELF_INTERSECTION_ERROR_MESSAGE,
+  type PolygonCrossingInfo
+} from '~/utils/roof-polygon-order'
 
 const {
   selectedProperty,
   selectCoordinates,
-  startRoofAssessment,
   isDrawingRoof,
   drawnRoofPoints,
   roofBoundaryDrawn,
   roofAreaSqM,
-  startDrawRoof,
+  activeRoofModel,
+  boundaryValidationMessage,
+  boundaryCrossings,
+  isBoundarySelfIntersecting,
+  recordDragStartSnapshot,
   addRoofPoint,
   updateRoofPoint,
   undoLastRoofPoint,
   finishRoof,
   clearRoof,
-  redrawRoof,
   recalculateAll,
   placedPanels,
   setbackPolygonPoints,
   obstructions,
   rooftopFeatures,
-  addObstruction,
   shadingAssessment,
-  boundaryValidationMessage,
   setbackM,
   centerOnDigosTrigger,
-  // AI-Assisted Roof Boundary Workflow
+  // Manual Roof Boundary & Editing Workflow
   roofAssessmentState,
   roofDrawingMode,
-  detectionResult,
-  detectionConfidence,
-  detectionConfidenceCategory,
-  detectionSource,
-  detectionMessage,
-  installerEditsCount,
   pointHistory,
   pointRedoHistory,
   selectedVertexIndex,
-  verifiedRoofData,
-  autoDetectRoof,
   startManualDrawRoof,
   enterEditPointsMode,
   toggleAddPointMode,
@@ -53,7 +48,6 @@ const {
   insertRoofPointAt,
   deleteRoofPointAt,
   confirmRoofAssessment,
-  redrawRoofManually,
   recalculateAreaFromPoints
 } = useSiteAssessment()
 
@@ -95,11 +89,6 @@ const outsideDigosAlert = ref(false)
 const drawingFeedback = ref('')
 const showRedrawConfirmModal = ref(false)
 
-// Obstruction Placement Mode State
-const isPlacingObstructionOnMap = ref(false)
-const isObstructionModalOpen = ref(false)
-const pendingObstacleCoords = ref<{ lat: number; lng: number; x: number; z: number } | null>(null)
-
 // Fallback manual inputs
 const manualLatInput = ref(selectedProperty.value?.latitude.toString() || '6.7497')
 const manualLngInput = ref(selectedProperty.value?.longitude.toString() || '125.3572')
@@ -115,6 +104,9 @@ let activePolygon: google.maps.Polygon | null = null
 let activePolyline: google.maps.Polyline | null = null
 let vertexMarkers: google.maps.Marker[] = []
 let polygonPathListeners: google.maps.MapsEventListener[] = []
+let crossingWarningPolylines: google.maps.Polyline[] = []
+let crossingWarningMarkers: google.maps.Marker[] = []
+let activeDraggingMarkerIdx: number | null = null
 
 // Visual Layer Overlays on Map
 let setbackPolygonOverlay: google.maps.Polygon | null = null
@@ -381,10 +373,13 @@ function updateEdgeGuidePreview(latLng: google.maps.LatLng) {
   let closestProj: { lat: number; lng: number } | null = null
   let minDistanceM = Infinity
 
-  const numEdges = isDrawingRoof.value ? drawnRoofPoints.value.length - 1 : drawnRoofPoints.value.length
+  const pts = drawnRoofPoints.value.length >= 3
+    ? orderRoofPolygonVertices(drawnRoofPoints.value).points
+    : drawnRoofPoints.value
+  const numEdges = pts.length >= 3 ? pts.length : pts.length - 1
   for (let i = 0; i < numEdges; i++) {
-    const a = drawnRoofPoints.value[i]
-    const b = drawnRoofPoints.value[(i + 1) % drawnRoofPoints.value.length]
+    const a = pts[i]
+    const b = pts[(i + 1) % pts.length]
     if (!a || !b) continue
     const proj = projectPointOnSegment(p, a, b)
     const distM = google.maps.geometry.spherical.computeDistanceBetween(latLng, new google.maps.LatLng(proj.lat, proj.lng))
@@ -434,15 +429,82 @@ function findBestEdgeInsertIndex(latLng: { lat: number; lng: number }, points: A
   return bestIdx
 }
 
+function clearCrossingHighlights() {
+  crossingWarningPolylines.forEach(p => p.setMap(null))
+  crossingWarningPolylines = []
+  crossingWarningMarkers.forEach(m => m.setMap(null))
+  crossingWarningMarkers = []
+}
+
+function renderCrossingHighlights(
+  points: Array<{ lat: number; lng: number }>,
+  crossings: PolygonCrossingInfo[]
+) {
+  clearCrossingHighlights()
+  if (!googleMap || !window.google?.maps || crossings.length === 0) return
+
+  const highlightedEdges = new Set<string>()
+  for (const crossing of crossings) {
+    const edges: Array<[number, number]> = [crossing.edgeA, crossing.edgeB]
+    for (const [iA, iB] of edges) {
+      const key = iA < iB ? `${iA}-${iB}` : `${iB}-${iA}`
+      if (highlightedEdges.has(key)) continue
+      highlightedEdges.add(key)
+
+      const ptA = points[iA]
+      const ptB = points[iB]
+      if (!ptA || !ptB) continue
+
+      const line = new google.maps.Polyline({
+        path: [
+          new google.maps.LatLng(ptA.lat, ptA.lng),
+          new google.maps.LatLng(ptB.lat, ptB.lng)
+        ],
+        map: googleMap,
+        strokeColor: '#ef4444',
+        strokeOpacity: 1,
+        strokeWeight: 4,
+        clickable: false,
+        zIndex: 25
+      })
+      crossingWarningPolylines.push(line)
+    }
+
+    const marker = new google.maps.Marker({
+      position: new google.maps.LatLng(crossing.intersection.lat, crossing.intersection.lng),
+      map: googleMap,
+      clickable: false,
+      title: SELF_INTERSECTION_ERROR_MESSAGE,
+      zIndex: 30,
+      label: {
+        text: '!',
+        color: '#ffffff',
+        fontSize: '11px',
+        fontWeight: 'bold'
+      },
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        scale: 9,
+        fillColor: '#dc2626',
+        fillOpacity: 1,
+        strokeColor: '#fef08a',
+        strokeWeight: 2.5,
+        labelOrigin: new google.maps.Point(0, 0),
+        anchor: new google.maps.Point(0, 0)
+      }
+    })
+    crossingWarningMarkers.push(marker)
+  }
+}
+
 function openVertexInfoWindow(idx: number, marker: google.maps.Marker) {
   if (!googleMap || !window.google?.maps) return
   const pt = drawnRoofPoints.value[idx]
   if (!pt) return
 
   selectedVertexIndex.value = idx
-  const isAi = (pt as { source?: string }).source === 'ai'
-  const sourceLabel = isAi ? 'AI Suggested' : 'Installer Added'
-  const sourceBadgeColor = isAi ? '#8b5cf6' : '#2563eb'
+  const sourceLabel = 'Installer Added'
+  const sourceBadgeColor = '#2563eb'
 
   const content = `
     <div style="font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; font-size: 11px; padding: 4px; min-width: 175px;">
@@ -491,6 +553,7 @@ function openVertexInfoWindow(idx: number, marker: google.maps.Marker) {
 
 function syncVertexMarkers() {
   if (!googleMap || !window.google?.maps) return
+  if (activeDraggingMarkerIdx !== null) return
 
   // In CONFIRMED state, we hide interactive vertex markers unless editing
   if (roofAssessmentState.value === 'CONFIRMED' && !isDrawingRoof.value) {
@@ -500,7 +563,6 @@ function syncVertexMarkers() {
   }
 
   const shouldBeVisible = isDrawingRoof.value ||
-    roofAssessmentState.value === 'DETECTED' ||
     roofAssessmentState.value === 'EDITING' ||
     roofDrawingMode.value === 'add-point'
 
@@ -516,8 +578,6 @@ function syncVertexMarkers() {
     if (m) m.setMap(null)
   }
 
-  const isAiState = roofAssessmentState.value === 'DETECTED'
-
   drawnRoofPoints.value.forEach((pt, idx) => {
     const pos = new google.maps.LatLng(pt.lat, pt.lng)
     let marker = vertexMarkers[idx]
@@ -529,34 +589,59 @@ function syncVertexMarkers() {
         draggable: true,
         cursor: 'grab'
       })
+      ;(newMarker as any).__vertexIdx = idx
+
+      const onDragStart = () => {
+        const currentIdx = typeof (newMarker as any).__vertexIdx === 'number'
+          ? (newMarker as any).__vertexIdx
+          : idx
+        activeDraggingMarkerIdx = currentIdx
+        if (vertexInfoWindow) vertexInfoWindow.close()
+        recordDragStartSnapshot()
+      }
 
       const onDrag = () => {
         const p = newMarker.getPosition()
         if (!p) return
-        updateRoofPoint(idx, p.lat(), p.lng())
+        const currentIdx = typeof (newMarker as any).__vertexIdx === 'number'
+          ? (newMarker as any).__vertexIdx
+          : idx
+        updateRoofPoint(currentIdx, p.lat(), p.lng(), false)
         refreshPolygonFromPoints()
       }
 
       const onDragEnd = () => {
         const p = newMarker.getPosition()
-        if (!p) return
-        updateRoofPoint(idx, p.lat(), p.lng())
-        recalculateAreaFromPoints()
+        const currentIdx = typeof (newMarker as any).__vertexIdx === 'number'
+          ? (newMarker as any).__vertexIdx
+          : idx
+        activeDraggingMarkerIdx = null
+        if (!p) {
+          syncVertexMarkers()
+          return
+        }
+        updateRoofPoint(currentIdx, p.lat(), p.lng(), true)
+        syncVertexMarkers()
         refreshPolygonFromPoints()
       }
 
+      newMarker.addListener('dragstart', onDragStart)
       newMarker.addListener('drag', onDrag)
       newMarker.addListener('dragend', onDragEnd)
 
       newMarker.addListener('click', () => {
-        selectedVertexIndex.value = idx
+        const currentIdx = typeof (newMarker as any).__vertexIdx === 'number'
+          ? (newMarker as any).__vertexIdx
+          : idx
+        selectedVertexIndex.value = currentIdx
         syncVertexMarkers()
-        openVertexInfoWindow(idx, newMarker)
+        openVertexInfoWindow(currentIdx, newMarker)
       })
 
       vertexMarkers.push(newMarker)
       marker = newMarker
     } else {
+      ;(marker as any).__vertexIdx = idx
       marker.setPosition(pos)
       marker.setMap(googleMap)
       marker.setDraggable(true)
@@ -564,15 +649,15 @@ function syncVertexMarkers() {
 
     const isLatest = idx === drawnRoofPoints.value.length - 1
     const isSelected = selectedVertexIndex.value === idx
-    const ptColor = isSelected
-      ? '#f59e0b'
-      : (isAiState
-        ? '#8b5cf6'
-        : (isLatest && isDrawingRoof.value ? '#10b981' : '#2563eb'))
+    const ptColor = isBoundarySelfIntersecting.value
+      ? '#dc2626'
+      : isSelected
+        ? '#f59e0b'
+        : (isLatest && isDrawingRoof.value ? '#10b981' : '#2563eb')
 
     marker.setLabel({
       text: `${idx + 1}`,
-      color: isSelected ? '#000000' : '#ffffff',
+      color: isSelected && !isBoundarySelfIntersecting.value ? '#000000' : '#ffffff',
       fontSize: isSelected ? '12px' : '11px',
       fontWeight: 'bold'
     })
@@ -611,6 +696,7 @@ function updateVertexMarkersAppearance() {
 function clearMapDrawingObjects() {
   polygonPathListeners.forEach(l => l.remove())
   polygonPathListeners = []
+  activeDraggingMarkerIdx = null
 
   if (activePolygon) {
     activePolygon.setMap(null)
@@ -633,6 +719,7 @@ function clearMapDrawingObjects() {
     edgeGuidePolyline = null
   }
 
+  clearCrossingHighlights()
   clearVisualOverlays()
 }
 
@@ -679,8 +766,16 @@ async function handleStartRoofDrawing() {
 
 // Requirement 2: Extreme Roof Inspection Mode When Editing Starts
 async function handleStartRoofEditing() {
+  recalculateAreaFromPoints()
   enterEditPointsMode()
   if (googleMap && drawnRoofPoints.value.length > 0) {
+    if (edgeGuidePolyline) {
+      edgeGuidePolyline.setMap(null)
+    }
+    googleMap.setOptions({
+      draggableCursor: null,
+      disableDoubleClickZoom: false
+    })
     const targetCenter = getRoofOrCurrentCenter()
     const result = await queryAndUpdateMaxZoom(targetCenter)
     googleMap.panTo(targetCenter)
@@ -737,57 +832,34 @@ function confirmDiscardChanges() {
 
 function closeRoofEditorDirectly() {
   showDiscardConfirm.value = false
+  if (drawnRoofPoints.value.length >= 3) {
+    const ordered = orderRoofPolygonVertices(drawnRoofPoints.value)
+    if (!ordered.validation.isValid) {
+      boundaryValidationMessage.value = ordered.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+      boundaryCrossings.value = ordered.validation.crossings
+      syncVertexMarkers()
+      refreshPolygonFromPoints()
+      return
+    }
+  }
+
   roofDrawingMode.value = 'none'
   isDrawingRoof.value = false
   selectedVertexIndex.value = null
   if (vertexInfoWindow) {
     vertexInfoWindow.close()
   }
-  if (drawnRoofPoints.value.length >= 3) {
+  if (drawnRoofPoints.value.length >= 3 && roofBoundaryDrawn.value) {
     roofAssessmentState.value = 'CONFIRMED'
-    roofBoundaryDrawn.value = true
+  } else if (drawnRoofPoints.value.length >= 3) {
+    isDrawingRoof.value = true
+    roofDrawingMode.value = 'manual-draw'
+    roofAssessmentState.value = 'IDLE'
   } else {
     roofAssessmentState.value = 'IDLE'
   }
-}
-
-// Trigger Auto-Detection
-async function handleTriggerAutoDetect() {
-  if (roofAssessmentState.value === 'DETECTING') return
-
-  let targetLat: number | undefined
-  let targetLng: number | undefined
-  let targetPlaceId: string | undefined
-
-  if (selectedProperty.value) {
-    targetLat = selectedProperty.value.latitude
-    targetLng = selectedProperty.value.longitude
-    targetPlaceId = selectedProperty.value.placeId
-  } else if (googleMap) {
-    const center = googleMap.getCenter()
-    if (center) {
-      targetLat = center.lat()
-      targetLng = center.lng()
-    }
-  }
-
-  if (typeof targetLat !== 'number' || typeof targetLng !== 'number') {
-    alert('Please center the map over a building or select a property first.')
-    return
-  }
-
-  const result = await autoDetectRoof({
-    latitude: targetLat,
-    longitude: targetLng,
-    placeId: targetPlaceId
-  })
-
-  if (result.success && drawnRoofPoints.value.length >= 3) {
-    snapshotCurrentRoof()
-    await handleRoofCloseUp()
-    refreshPolygonFromPoints()
-    syncVertexMarkers()
-  }
+  syncVertexMarkers()
+  refreshPolygonFromPoints()
 }
 
 function fitRoofBounds(padding: number = 50) {
@@ -799,13 +871,16 @@ function fitRoofBounds(padding: number = 50) {
 
 function computeDrawnRoofArea(): number {
   if (drawnRoofPoints.value.length < 3) return 0
+  const ordered = orderRoofPolygonVertices(drawnRoofPoints.value)
+  if (!ordered.validation.isValid || ordered.points.length < 3) return 0
+
+  const points = ordered.points
   if (window.google?.maps?.geometry?.spherical) {
-    const path = drawnRoofPoints.value.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
+    const path = points.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
     const area = google.maps.geometry.spherical.computeArea(path)
     return Number(area.toFixed(1))
   }
   // Fallback planar Shoelace formula if Google geometry library is not yet loaded
-  const points = drawnRoofPoints.value
   const latCenter = points.reduce((acc, p) => acc + p.lat, 0) / points.length
   const latRad = (latCenter * Math.PI) / 180
   const metersPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latRad) + 1.175 * Math.cos(4 * latRad)
@@ -841,9 +916,11 @@ function addDrawingVertex(latLng: google.maps.LatLng) {
   syncVertexMarkers()
   refreshPolygonFromPoints()
 
-  if (drawnRoofPoints.value.length >= 3) {
+  if (boundaryValidationMessage.value) {
+    drawingFeedback.value = boundaryValidationMessage.value
+  } else if (drawnRoofPoints.value.length >= 3) {
     const area = computeDrawnRoofArea()
-    drawingFeedback.value = `${drawnRoofPoints.value.length} corners placed. Google Maps Area: ${area} m². Double-click map or click FINISH when done.`
+    drawingFeedback.value = `${drawnRoofPoints.value.length} corners placed. Google Maps Area: ${area} m². Double-click map or click CONFIRM ROOF when done.`
   } else {
     drawingFeedback.value = `${drawnRoofPoints.value.length} of 3 minimum corners placed. Click map to add next corner.`
   }
@@ -856,9 +933,11 @@ function handleUndoLastPoint() {
   syncVertexMarkers()
   refreshPolygonFromPoints()
 
-  if (drawnRoofPoints.value.length >= 3) {
+  if (boundaryValidationMessage.value) {
+    drawingFeedback.value = boundaryValidationMessage.value
+  } else if (drawnRoofPoints.value.length >= 3) {
     const area = computeDrawnRoofArea()
-    drawingFeedback.value = `${drawnRoofPoints.value.length} corners placed. Google Maps Area: ${area} m². Click FINISH ROOF when done.`
+    drawingFeedback.value = `${drawnRoofPoints.value.length} corners placed. Google Maps Area: ${area} m². Click CONFIRM ROOF when done.`
   } else if (drawnRoofPoints.value.length > 0) {
     drawingFeedback.value = `${drawnRoofPoints.value.length} of 3 minimum corners placed. Click map to add next corner.`
   } else {
@@ -869,32 +948,39 @@ function handleUndoLastPoint() {
 function refreshPolygonFromPoints() {
   if (!googleMap || !window.google?.maps) return
 
-  const path = drawnRoofPoints.value.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
+  if (drawnRoofPoints.value.length >= 3) {
+    const ordered = orderRoofPolygonVertices(drawnRoofPoints.value)
+    const displayPoints = ordered.points
+    const path = displayPoints.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
+    const isValid = ordered.validation.isValid
 
-  // Visual appearance styles based on UI State (AI Suggestion, Editing, Confirmed)
-  let strokeColor = '#2563eb'
-  let fillColor = '#3b82f6'
-  let fillOpacity = 0.22
-  let strokeWeight = 2.5
+    // Visual appearance styles based on validation & UI State
+    let strokeColor = '#2563eb'
+    let fillColor = '#3b82f6'
+    let fillOpacity = 0.22
+    let strokeWeight = 2.5
 
-  if (roofAssessmentState.value === 'DETECTED') {
-    strokeColor = '#8b5cf6' // Distinct AI-suggested purple
-    fillColor = '#8b5cf6'
-    fillOpacity = 0.16
-    strokeWeight = 3
-  } else if (roofAssessmentState.value === 'CONFIRMED') {
-    strokeColor = '#10b981' // Solid Emerald for installer-verified roof
-    fillColor = '#10b981'
-    fillOpacity = 0.20
-    strokeWeight = 2.5
-  } else if (roofAssessmentState.value === 'EDITING' || roofDrawingMode.value === 'add-point') {
-    strokeColor = '#2563eb' // Precision Blueprint Blue
-    fillColor = '#3b82f6'
-    fillOpacity = 0.22
-    strokeWeight = 2.5
-  }
+    if (!isValid) {
+      strokeColor = '#ef4444'
+      fillColor = '#ef4444'
+      fillOpacity = 0.20
+      strokeWeight = 3.0
+      renderCrossingHighlights(displayPoints, ordered.validation.crossings)
+    } else {
+      clearCrossingHighlights()
+      if (roofAssessmentState.value === 'CONFIRMED') {
+        strokeColor = '#10b981' // Solid Emerald for installer-verified roof
+        fillColor = '#10b981'
+        fillOpacity = 0.20
+        strokeWeight = 2.5
+      } else if (roofAssessmentState.value === 'EDITING' || roofDrawingMode.value === 'add-point') {
+        strokeColor = '#2563eb' // Precision Blueprint Blue
+        fillColor = '#3b82f6'
+        fillOpacity = 0.22
+        strokeWeight = 2.5
+      }
+    }
 
-  if (path.length >= 3) {
     if (!activePolygon) {
       activePolygon = new google.maps.Polygon({
         paths: path,
@@ -920,12 +1006,14 @@ function refreshPolygonFromPoints() {
         }
       })
     } else {
+      activePolygon.setEditable(false)
       activePolygon.setPaths(path)
       activePolygon.setOptions({
         strokeColor,
         strokeWeight,
         fillColor,
-        fillOpacity
+        fillOpacity,
+        editable: false
       })
     }
 
@@ -933,7 +1021,13 @@ function refreshPolygonFromPoints() {
       activePolyline.setMap(null)
       activePolyline = null
     }
-  } else if (path.length >= 2) {
+  } else if (drawnRoofPoints.value.length === 2) {
+    clearCrossingHighlights()
+    const path = drawnRoofPoints.value.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
+    if (activePolygon) {
+      activePolygon.setMap(null)
+      activePolygon = null
+    }
     if (!activePolyline) {
       activePolyline = new google.maps.Polyline({
         path,
@@ -945,7 +1039,8 @@ function refreshPolygonFromPoints() {
     } else {
       activePolyline.setPath(path)
     }
-  } else if (path.length < 2) {
+  } else {
+    clearCrossingHighlights()
     if (activePolyline) {
       activePolyline.setMap(null)
       activePolyline = null
@@ -957,6 +1052,20 @@ function refreshPolygonFromPoints() {
   }
 }
 
+async function handleConfirmEditedRoof() {
+  const ok = await confirmRoofAssessment()
+  if (!ok) {
+    syncVertexMarkers()
+    refreshPolygonFromPoints()
+    return
+  }
+  snapshotCurrentRoof()
+  syncVertexMarkers()
+  refreshPolygonFromPoints()
+  renderVisualOverlays()
+  fitRoofBounds(60)
+}
+
 // Requirement 9 & 10: Finish Roof & Fit Completed Roof
 async function handleFinishRoofDrawing() {
   if (drawnRoofPoints.value.length < 3) {
@@ -965,6 +1074,14 @@ async function handleFinishRoofDrawing() {
   }
 
   const finalArea = computeDrawnRoofArea()
+  const ok = await finishRoof(finalArea)
+  if (!ok) {
+    drawingFeedback.value = boundaryValidationMessage.value || SELF_INTERSECTION_ERROR_MESSAGE
+    syncVertexMarkers()
+    refreshPolygonFromPoints()
+    return
+  }
+
   if (edgeGuidePolyline) {
     edgeGuidePolyline.setMap(null)
   }
@@ -975,39 +1092,12 @@ async function handleFinishRoofDrawing() {
     })
   }
 
-  // Remove individual marker icons and enable Google Maps native editable polygon handles
-  vertexMarkers.forEach(m => m.setMap(null))
-  vertexMarkers = []
-
-  if (activePolygon) {
-    activePolygon.setEditable(true)
-
-    // Listen to live edits when installer moves/inserts/deletes polygon vertices
-    const polygonPath = activePolygon.getPath()
-    const handlePolygonChange = () => {
-      const newPoints: Array<{ lat: number; lng: number }> = []
-      for (let i = 0; i < polygonPath.getLength(); i++) {
-        const pt = polygonPath.getAt(i)
-        newPoints.push({ lat: pt.lat(), lng: pt.lng() })
-      }
-      drawnRoofPoints.value = newPoints
-      const editedArea = computeDrawnRoofArea()
-      roofAreaSqM.value = editedArea
-      recalculateAll()
-      renderVisualOverlays()
-    }
-
-    polygonPathListeners = [
-      polygonPath.addListener('set_at', handlePolygonChange),
-      polygonPath.addListener('insert_at', handlePolygonChange),
-      polygonPath.addListener('remove_at', handlePolygonChange)
-    ]
-  }
-
-  await finishRoof(finalArea)
+  snapshotCurrentRoof()
+  syncVertexMarkers()
+  refreshPolygonFromPoints()
   renderVisualOverlays()
   fitRoofBounds(60) // Requirement 10: Auto-fit completed roof with comfortable padding
-  drawingFeedback.value = `Roof boundary active (${drawnRoofPoints.value.length} vertices, ${roofAreaSqM.value} m²). Drag polygon handles anytime to adjust.`
+  drawingFeedback.value = `Roof boundary active (${drawnRoofPoints.value.length} vertices, ${roofAreaSqM.value} m²). Click EDIT POINTS anytime to adjust.`
 }
 
 function handleClearRoofDrawing() {
@@ -1054,9 +1144,18 @@ function localMetersToLatLng(x: number, z: number, centerLat: number, centerLng:
 }
 
 function renderVisualOverlays() {
-  if (!googleMap || !window.google?.maps || !selectedProperty.value) return
-  const centerLat = selectedProperty.value.latitude
-  const centerLng = selectedProperty.value.longitude
+  if (!googleMap || !window.google?.maps) return
+
+  let centerLat: number | undefined = activeRoofModel.value?.origin?.latitude
+  let centerLng: number | undefined = activeRoofModel.value?.origin?.longitude
+  if ((centerLat === undefined || centerLng === undefined) && drawnRoofPoints.value.length >= 3) {
+    centerLat = drawnRoofPoints.value.reduce((s, p) => s + p.lat, 0) / drawnRoofPoints.value.length
+    centerLng = drawnRoofPoints.value.reduce((s, p) => s + p.lng, 0) / drawnRoofPoints.value.length
+  } else if ((centerLat === undefined || centerLng === undefined) && selectedProperty.value) {
+    centerLat = selectedProperty.value.latitude
+    centerLng = selectedProperty.value.longitude
+  }
+  if (centerLat === undefined || centerLng === undefined) return
 
   clearVisualOverlays()
 
@@ -1267,32 +1366,6 @@ watch(
 )
 
 // ==========================================
-// OBSTRUCTION PLACEMENT INTERACTION
-// ==========================================
-
-function handleStartObstructionPlacement() {
-  isPlacingObstructionOnMap.value = true
-  if (googleMap) {
-    googleMap.setOptions({ draggableCursor: 'crosshair' })
-  }
-}
-
-function handleSavePlacedObstruction(data: Partial<RoofObstacle>) {
-  if (pendingObstacleCoords.value) {
-    data.latitude = pendingObstacleCoords.value.lat
-    data.longitude = pendingObstacleCoords.value.lng
-    data.position = {
-      x: pendingObstacleCoords.value.x,
-      y: 3.5,
-      z: pendingObstacleCoords.value.z
-    }
-  }
-  addObstruction(data)
-  pendingObstacleCoords.value = null
-  renderVisualOverlays()
-}
-
-// ==========================================
 // MAP INITIALIZATION
 // ==========================================
 
@@ -1390,11 +1463,7 @@ async function mountGoogleMap() {
 watch(
   () => roofAssessmentState.value,
   (newState) => {
-    if (newState === 'DETECTED') {
-      refreshPolygonFromPoints()
-      syncVertexMarkers()
-      fitRoofBounds(50)
-    } else if (newState === 'EDITING') {
+    if (newState === 'EDITING') {
       if (savedRoofSnapshot.value.length === 0 && drawnRoofPoints.value.length >= 3) {
         snapshotCurrentRoof()
       }
@@ -1404,10 +1473,6 @@ watch(
       refreshPolygonFromPoints()
       syncVertexMarkers()
       fitRoofBounds(60)
-    } else if (newState === 'IDLE' || newState === 'FAILED') {
-      if (newState === 'FAILED') {
-        clearMapDrawingObjects()
-      }
     }
   }
 )
@@ -1435,7 +1500,7 @@ watch(
   }
 )
 
-// Map Click Handler: Roof Point / Obstruction Drop / Survey Site Select
+// Map Click Handler: Roof Point / Survey Site Select
   googleMap.addListener('click', async (e: google.maps.MapMouseEvent) => {
     if (!e.latLng) return
     const lat = e.latLng.lat()
@@ -1450,34 +1515,13 @@ watch(
       return
     }
 
-    // 1. Placing Obstruction on Map
-    if (isPlacingObstructionOnMap.value) {
-      isPlacingObstructionOnMap.value = false
-      if (googleMap) googleMap.setOptions({ draggableCursor: null })
-
-      const centerLat = selectedProperty.value?.latitude ?? lat
-      const centerLng = selectedProperty.value?.longitude ?? lng
-      const earthRadiusM = 6378137
-      const localX = (lng - centerLng) * (Math.PI / 180) * Math.cos(centerLat * Math.PI / 180) * earthRadiusM
-      const localZ = (lat - centerLat) * (Math.PI / 180) * earthRadiusM
-
-      pendingObstacleCoords.value = {
-        lat,
-        lng,
-        x: Number(localX.toFixed(2)),
-        z: Number(localZ.toFixed(2))
-      }
-      isObstructionModalOpen.value = true
-      return
-    }
-
-    // 2. In Roof Draw Mode: clicks add perimeter vertices
+    // 1. In Roof Draw Mode: clicks add perimeter vertices
     if (isDrawingRoof.value) {
       addDrawingVertex(e.latLng)
       return
     }
 
-    // 3. Normal Mode: Select property
+    // 2. Normal Mode: Select property
     if (!isInsideDigos(lat, lng)) {
       outsideDigosAlert.value = true
       return
@@ -1624,146 +1668,17 @@ onBeforeUnmount(() => {
 
     <!-- Active Overlay HUDs -->
     <template v-if="mapStatus === 'ready'">
-      <!-- 1. DETECTING ROOF BOUNDARY (Loading State) -->
+      <!-- 1. EDITING ROOF BOUNDARY (Installer Active Modification) -->
       <div
-        v-if="roofAssessmentState === 'DETECTING'"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-5 py-3 rounded-2xl shadow-2xl border-2 border-purple-500/90 flex items-center gap-3.5 animate-fadeIn min-w-[340px]"
-      >
-        <div class="w-5 h-5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
-        <div>
-          <div class="font-bold text-xs uppercase tracking-wider text-purple-400">Detecting roof...</div>
-          <p class="text-[11px] text-slate-300">Searching roof boundary from satellite map position...</p>
-        </div>
-      </div>
-
-      <!-- 2. AI-SUGGESTED ROOF BOUNDARY (Requires Installer Verification) -->
-      <div
-        v-else-if="roofAssessmentState === 'DETECTED'"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-5 py-3.5 rounded-2xl shadow-2xl border-2 border-purple-500 flex flex-col gap-2.5 animate-fadeIn min-w-[360px] max-w-xl"
+        v-if="roofAssessmentState === 'EDITING' && !isDrawingRoof && drawnRoofPoints.length >= 3"
+        :class="[
+          'absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-5 py-3 rounded-2xl shadow-2xl border-2 flex flex-col gap-2.5 animate-fadeIn min-w-[380px] max-w-xl',
+          isBoundarySelfIntersecting ? 'border-rose-500' : 'border-blue-500'
+        ]"
       >
         <div class="flex items-center justify-between border-b border-slate-800 pb-2">
           <div class="flex items-center gap-2">
-            <span class="w-2.5 h-2.5 rounded-full bg-purple-400 animate-pulse"></span>
-            <span class="font-bold text-xs uppercase tracking-wider text-purple-400">AI-SUGGESTED ROOF</span>
-          </div>
-          <div class="flex items-center gap-2 text-[11px]">
-            <span
-              :class="[
-                'px-2 py-0.5 rounded font-bold border text-[10px]',
-                detectionConfidenceCategory === 'HIGH'
-                  ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
-                  : detectionConfidenceCategory === 'MEDIUM'
-                    ? 'bg-amber-950 text-amber-300 border-amber-800'
-                    : 'bg-rose-950 text-rose-300 border-rose-800'
-              ]"
-            >
-              Model confidence: {{ detectionConfidence }}% ({{ detectionConfidenceCategory }})
-            </span>
-            <span class="bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700 font-mono text-[10px]">
-              Points: <strong class="text-white">{{ drawnRoofPoints.length }}</strong>
-            </span>
-            <span class="bg-purple-950 text-purple-200 px-2 py-0.5 rounded border border-purple-800 font-mono text-[10px]">
-              Estimated: <strong class="text-white">{{ roofAreaSqM.toFixed(1) }} m²</strong>
-            </span>
-          </div>
-        </div>
-
-        <div class="text-[11px] text-slate-300 leading-snug">
-          Please verify the highlighted boundary against the satellite image before confirming.
-        </div>
-
-        <div class="flex items-center justify-between gap-1.5 pt-1 flex-wrap">
-          <div class="flex items-center gap-1.5">
-            <button
-              type="button"
-              @click="handleRoofCloseUp"
-              class="px-2.5 py-1.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-200 border border-cyan-800 rounded-lg text-xs font-bold transition-colors flex items-center gap-1 cursor-pointer"
-              title="Inspect roof close-up"
-            >
-              <span>🎯</span>
-              <span>ROOF CLOSE-UP</span>
-            </button>
-
-            <button
-              type="button"
-              @click="handleTriggerMaxZoom"
-              class="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-lg text-xs transition-colors flex items-center gap-1 cursor-pointer shadow-sm"
-              title="Zoom to maximum available Google satellite imagery"
-            >
-              <span>⌕</span>
-              <span>MAX ZOOM</span>
-            </button>
-
-            <button
-              type="button"
-              @click="handleStartRoofEditing"
-              class="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold shadow-xs flex items-center gap-1 transition-colors cursor-pointer"
-            >
-              <span>✏️ EDIT POINTS</span>
-            </button>
-
-            <button
-              type="button"
-              @click="toggleAddPointMode"
-              :class="[
-                'px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors flex items-center gap-1 cursor-pointer',
-                roofDrawingMode === 'add-point'
-                  ? 'bg-amber-500 text-slate-950 border-amber-400 font-bold'
-                  : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
-              ]"
-            >
-              <span>+ ADD POINT</span>
-            </button>
-
-            <button
-              type="button"
-              @click="undoRoofPointEdit"
-              :disabled="pointHistory.length === 0"
-              class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
-              title="Undo vertex edit"
-            >
-              ↩ UNDO
-            </button>
-
-            <button
-              type="button"
-              @click="redoRoofPointEdit"
-              :disabled="pointRedoHistory.length === 0"
-              class="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
-              title="Redo vertex edit"
-            >
-              ↪ REDO
-            </button>
-          </div>
-
-          <div class="flex items-center gap-1.5">
-            <button
-              type="button"
-              @click="redrawRoofManually"
-              class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
-            >
-              REDRAW MANUALLY
-            </button>
-
-            <button
-              type="button"
-              @click="confirmRoofAssessment"
-              class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs shadow-md shadow-emerald-600/30 transition-all flex items-center gap-1 cursor-pointer"
-            >
-              <span>✓ CONFIRM ROOF</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 3. EDITING ROOF BOUNDARY (Installer Active Modification) -->
-      <div
-        v-else-if="roofAssessmentState === 'EDITING' && !isDrawingRoof && drawnRoofPoints.length >= 3"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-5 py-3 rounded-2xl shadow-2xl border-2 border-blue-500 flex flex-col gap-2.5 animate-fadeIn min-w-[380px] max-w-xl"
-      >
-        <div class="flex items-center justify-between border-b border-slate-800 pb-2">
-          <div class="flex items-center gap-2">
-            <span class="w-2.5 h-2.5 rounded-full bg-blue-400"></span>
+            <span :class="['w-2.5 h-2.5 rounded-full', isBoundarySelfIntersecting ? 'bg-rose-500 animate-ping' : 'bg-blue-400']"></span>
             <span class="font-bold text-sm text-white">Edit Roof</span>
           </div>
 
@@ -1772,8 +1687,15 @@ onBeforeUnmount(() => {
               <span class="bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700 text-[10px]">
                 Vertices: <strong class="text-white">{{ drawnRoofPoints.length }}</strong>
               </span>
-              <span class="bg-blue-950 text-blue-200 px-2 py-0.5 rounded border border-blue-800 text-[10px]">
-                Area: <strong class="text-white">{{ roofAreaSqM.toFixed(1) }} m²</strong>
+              <span
+                :class="[
+                  'px-2 py-0.5 rounded border text-[10px]',
+                  isBoundarySelfIntersecting
+                    ? 'bg-rose-950 text-rose-200 border-rose-700'
+                    : 'bg-blue-950 text-blue-200 border-blue-800'
+                ]"
+              >
+                Area: <strong class="text-white">{{ isBoundarySelfIntersecting ? 'Invalid' : `${roofAreaSqM.toFixed(1)} m²` }}</strong>
               </span>
             </div>
 
@@ -1787,6 +1709,15 @@ onBeforeUnmount(() => {
               ✕
             </button>
           </div>
+        </div>
+
+        <!-- Crossing / Self-Intersection Validation Banner -->
+        <div
+          v-if="boundaryValidationMessage"
+          class="bg-rose-950/90 border border-rose-500 rounded-xl px-3 py-2 text-xs text-rose-200 font-semibold flex items-center gap-2"
+        >
+          <span>⚠️</span>
+          <span>{{ boundaryValidationMessage }}</span>
         </div>
 
         <!-- Discard unsaved changes confirmation banner inside HUD -->
@@ -1891,7 +1822,7 @@ onBeforeUnmount(() => {
           <div class="flex items-center gap-1.5">
             <button
               type="button"
-              @click="redrawRoofManually"
+              @click="handleStartRoofDrawing"
               class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium border border-slate-700 transition-colors cursor-pointer"
             >
               REDRAW MANUALLY
@@ -1899,9 +1830,9 @@ onBeforeUnmount(() => {
 
             <button
               type="button"
-              @click="confirmRoofAssessment"
-              :disabled="drawnRoofPoints.length < 3"
-              class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-lg text-xs shadow-md shadow-emerald-600/30 transition-all flex items-center gap-1 cursor-pointer"
+              @click="handleConfirmEditedRoof"
+              :disabled="drawnRoofPoints.length < 3 || isBoundarySelfIntersecting"
+              class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-lg text-xs shadow-md shadow-emerald-600/30 transition-all flex items-center gap-1 cursor-pointer"
             >
               <span>✓ CONFIRM ROOF</span>
             </button>
@@ -1909,39 +1840,19 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 4. DETECTION FAILED -->
-      <div
-        v-else-if="roofAssessmentState === 'FAILED'"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-5 py-3 rounded-2xl shadow-2xl border-2 border-rose-500/90 flex items-center justify-between gap-4 animate-fadeIn max-w-lg"
-      >
-        <div class="flex items-center gap-2.5">
-          <span class="text-base">⚠️</span>
-          <div>
-            <div class="font-bold text-xs uppercase tracking-wider text-rose-400">Roof Not Detected</div>
-            <p class="text-[11px] text-slate-300 leading-snug">
-              Roof not detected. Please draw the roof manually.
-            </p>
-          </div>
-        </div>
-        <button
-          type="button"
-          @click="handleStartRoofDrawing"
-          class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg text-xs whitespace-nowrap shadow-md transition-colors cursor-pointer"
-        >
-          MANUAL DRAW ROOF
-        </button>
-      </div>
-
-      <!-- 5. PRECISION ROOF DRAWING FLOATING CONTROL PANEL (Manual Draw Mode) -->
+      <!-- 2. PRECISION ROOF DRAWING FLOATING CONTROL PANEL (Manual Draw Mode) -->
       <div
         v-else-if="isDrawingRoof"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-4 py-3 rounded-2xl shadow-2xl border-2 border-blue-500/90 flex flex-col gap-2.5 animate-fadeIn min-w-[320px] max-w-lg"
+        :class="[
+          'absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white px-4 py-3 rounded-2xl shadow-2xl border-2 flex flex-col gap-2.5 animate-fadeIn min-w-[320px] max-w-xl',
+          isBoundarySelfIntersecting ? 'border-rose-500' : 'border-blue-500/90'
+        ]"
       >
         <!-- Header row -->
         <div class="flex items-center justify-between border-b border-slate-800 pb-2">
           <div class="flex items-center gap-2">
-            <span class="w-2.5 h-2.5 rounded-full bg-blue-500 animate-ping"></span>
-            <span class="font-bold text-xs uppercase tracking-wider text-blue-400">PRECISION ROOF DRAWING</span>
+            <span :class="['w-2.5 h-2.5 rounded-full animate-ping', isBoundarySelfIntersecting ? 'bg-rose-500' : 'bg-blue-500']"></span>
+            <span :class="['font-bold text-xs uppercase tracking-wider', isBoundarySelfIntersecting ? 'text-rose-400' : 'text-blue-400']">PRECISION ROOF DRAWING</span>
           </div>
           <div class="flex items-center gap-1.5 text-[11px] font-mono">
             <span class="bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700">
@@ -1953,13 +1864,22 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <!-- Crossing / Self-Intersection Validation Banner -->
+        <div
+          v-if="boundaryValidationMessage"
+          class="bg-rose-950/90 border border-rose-500 rounded-xl px-3 py-2 text-xs text-rose-200 font-semibold flex items-center gap-2"
+        >
+          <span>⚠️</span>
+          <span>{{ boundaryValidationMessage }}</span>
+        </div>
+
         <!-- Feedback instruction -->
-        <div class="text-[11px] text-slate-300 leading-snug">
+        <div v-else class="text-[11px] text-slate-300 leading-snug">
           {{ drawingFeedback }}
         </div>
 
         <!-- Controls row -->
-        <div class="flex items-center justify-between gap-1.5 pt-1">
+        <div class="flex items-center justify-between gap-1.5 pt-1 flex-wrap">
           <!-- Extreme Precision Zoom Controls (Requirements 3, 4, 5, 6) -->
           <div class="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 gap-1">
             <button
@@ -2028,20 +1948,31 @@ onBeforeUnmount(() => {
             <span>UNDO</span>
           </button>
 
-          <!-- Finish Roof (Requirement 9) -->
+          <!-- Edit Points (transitions to full Roof Editor when >= 3 points) -->
+          <button
+            v-if="drawnRoofPoints.length >= 3"
+            type="button"
+            @click="handleStartRoofEditing"
+            class="px-2.5 py-1.5 bg-blue-950 hover:bg-blue-900 text-blue-200 border border-blue-700 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+            title="Edit roof points before confirming"
+          >
+            <span>✏️ EDIT</span>
+          </button>
+
+          <!-- Finish / Confirm Roof (Requirement 9) -->
           <button
             type="button"
             @click="handleFinishRoofDrawing"
-            :disabled="drawnRoofPoints.length < 3"
+            :disabled="drawnRoofPoints.length < 3 || isBoundarySelfIntersecting"
             :class="[
-              'px-3.5 py-1.5 rounded-lg font-bold text-xs shadow-md transition-all flex items-center gap-1.5 cursor-pointer',
-              drawnRoofPoints.length >= 3
-                ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-500/25'
+              'px-3.5 py-1.5 rounded-lg font-bold text-xs shadow-md transition-all flex items-center gap-1.5',
+              drawnRoofPoints.length >= 3 && !isBoundarySelfIntersecting
+                ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/25 cursor-pointer'
                 : 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
             ]"
-            title="Close boundary and calculate roof area"
+            title="Confirm roof boundary and calculate roof area"
           >
-            <span>✓ FINISH</span>
+            <span>✓ CONFIRM ROOF</span>
           </button>
 
           <!-- Cancel -->
@@ -2056,26 +1987,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- OBSTRUCTION PLACEMENT BANNER -->
-      <div
-        v-else-if="isPlacingObstructionOnMap"
-        class="absolute top-4 left-1/2 -translate-x-1/2 z-30 pointer-events-auto bg-amber-950/95 backdrop-blur-md text-white font-medium text-xs px-4 py-3 rounded-2xl shadow-2xl border-2 border-amber-500 flex items-center gap-3 animate-fadeIn"
-      >
-        <div class="flex items-center gap-2">
-          <span class="w-3 h-3 rounded-full bg-amber-400 animate-ping"></span>
-          <span class="font-bold text-amber-400 uppercase text-[11px]">CLICK MAP TO PLACE OBSTRUCTION</span>
-          <span class="text-slate-300 text-xs">Click near the roof to drop Tree, Water Tank, or Structure.</span>
-        </div>
-        <button
-          type="button"
-          @click="isPlacingObstructionOnMap = false"
-          class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded cursor-pointer"
-        >
-          Cancel
-        </button>
-      </div>
-
-      <!-- 6. INSTALLER-VERIFIED ROOF HUD BANNER -->
+      <!-- 3. INSTALLER-VERIFIED ROOF HUD BANNER -->
       <div
         v-else-if="roofAssessmentState === 'CONFIRMED' || roofBoundaryDrawn"
         class="absolute top-4 left-1/2 -translate-x-1/2 z-20 pointer-events-auto bg-slate-900/95 backdrop-blur-md text-white text-xs px-4 py-2.5 rounded-2xl shadow-xl border border-emerald-500/60 flex items-center gap-3 animate-fadeIn"
@@ -2086,9 +1998,6 @@ onBeforeUnmount(() => {
           <span class="font-mono text-slate-200 font-semibold">{{ roofAreaSqM.toFixed(1) }} m²</span>
           <span class="text-slate-400">|</span>
           <span class="font-mono text-blue-300 font-semibold">{{ drawnRoofPoints.length }} Vertices</span>
-          <span v-if="detectionSource === 'ai-assisted'" class="text-[9px] bg-purple-950 text-purple-300 border border-purple-800 px-1.5 py-0.5 rounded font-semibold">
-            AI-Assisted
-          </span>
         </div>
 
         <div class="flex items-center gap-1.5">
@@ -2119,7 +2028,7 @@ onBeforeUnmount(() => {
           </button>
           <button
             type="button"
-            @click="redrawRoofManually"
+            @click="handleStartRoofDrawing"
             class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold rounded-lg border border-slate-700 transition-colors cursor-pointer"
           >
             REDRAW
@@ -2174,37 +2083,15 @@ onBeforeUnmount(() => {
 
       <!-- Top Right: Action Buttons & Map Controls -->
       <div class="absolute top-4 right-4 z-10 flex items-center gap-2">
-        <!-- AUTO DETECT ROOF BUTTON -->
-        <button
-          type="button"
-          @click="handleTriggerAutoDetect"
-          :disabled="roofAssessmentState === 'DETECTING'"
-          class="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-          title="Auto-detect roof boundary from satellite map position"
-        >
-          <span v-if="roofAssessmentState === 'DETECTING'" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-          <span v-else>🤖</span>
-          <span>{{ roofAssessmentState === 'DETECTING' ? 'Detecting roof...' : 'AUTO DETECT ROOF' }}</span>
-        </button>
-
         <!-- MANUAL DRAW ROOF BUTTON -->
         <button
-          v-if="!isDrawingRoof && roofAssessmentState !== 'DETECTED' && roofAssessmentState !== 'EDITING'"
+          v-if="!isDrawingRoof && roofAssessmentState !== 'EDITING'"
           type="button"
           @click="handleStartRoofDrawing"
           class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer"
           title="Manually draw roof perimeter corners"
         >
           <span>✏️ MANUAL DRAW ROOF</span>
-        </button>
-
-        <!-- Add Obstruction Button -->
-        <button
-          type="button"
-          @click="handleStartObstructionPlacement"
-          class="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition-colors"
-        >
-          <span>+ ADD OBSTRUCTION</span>
         </button>
 
         <!-- Layer Selector Toggle -->
@@ -2338,13 +2225,6 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </template>
-
-    <!-- Obstruction Placement Modal -->
-    <ObstructionModal
-      :is-open="isObstructionModalOpen"
-      @close="isObstructionModalOpen = false"
-      @save="handleSavePlacedObstruction"
-    />
 
     <!-- REDRAW ROOF CONFIRMATION MODAL (Requirement 11) -->
     <div

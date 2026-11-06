@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useInstallerData } from '~/composables/useInstallerData'
 import { useSiteAssessment } from '~/composables/useSiteAssessment'
 import BabylonRoofViewer from '~/components/rooftop/BabylonRoofViewer.vue'
@@ -20,6 +20,13 @@ import {
 } from '~/utils/panel-placement'
 import {
   buildExactRoofGeometry,
+  applyGeneratedGeometryToRoofModel,
+  hydrateOrUpgradeRoofModel,
+  extractVerifiedFootprint2D,
+  extractVerifiedBoundaryLatLng,
+  computeSphericalPolygonAreaM2,
+  normalizeRoofStructureType,
+  ROOF_STRUCTURE_OPTIONS,
   localMetersToLatLng,
   latLngToLocalMeters,
   type RoofStructureType
@@ -34,6 +41,18 @@ import {
   DEFAULT_MOUNTING_CLEARANCE_M,
   snapPanelToRoofSurface
 } from '~/utils/roof-surface'
+import {
+  orderRoofPolygonVertices,
+  SELF_INTERSECTION_ERROR_MESSAGE
+} from '~/utils/roof-polygon-order'
+import {
+  SOLAR_PANEL_BRANDS,
+  getSolarPanelBrands,
+  getPanelModelsByBrand,
+  findPanelModel,
+  type SolarPanelSpecification,
+  type SolarPanelBrand
+} from '~/data/solar-panels'
 
 useHead({
   title: 'HELIOS-LOAD Solar Design Editor'
@@ -42,24 +61,56 @@ useHead({
 const { activeProject, updateProject, equipment } = useInstallerData()
 const {
   activeRoofModel,
-  roofPitchDegrees,
-  roofAzimuthDegrees,
-  roofStructureType,
   roofAreaSqM,
-  usableRoofAreaSqM,
-  eaveHeightM,
-  roofThicknessM,
-  setbackM,
-  drawnRoofPoints,
-  saveVerifiedRoofModel,
-  recalculateAll
+  hydrateStateFromProjectModel,
+  saveVerifiedRoofModel
 } = useSiteAssessment()
 
-// 3D Babylon Viewer Component Reference
+// 3D Babylon Viewer & Fullscreen Container References
 const viewerRef = ref<any>(null)
+const rooftopFullscreenRef = ref<HTMLDivElement | null>(null)
+const isViewerFullscreen = ref(false)
+const showHierarchyInFullscreen = ref(false)
+const showInspectorInFullscreen = ref(false)
 
-// Current Working Roof Model
+function handleViewerFullscreenChange(active: boolean) {
+  isViewerFullscreen.value = active
+  if (active) {
+    showHierarchyInFullscreen.value = false
+    showInspectorInFullscreen.value = false
+  }
+  nextTick(() => {
+    viewerRef.value?.resizeViewer?.()
+  })
+}
+
+function toggleFullscreenHierarchy() {
+  showHierarchyInFullscreen.value = !showHierarchyInFullscreen.value
+  nextTick(() => {
+    viewerRef.value?.resizeViewer?.()
+  })
+}
+
+function toggleFullscreenInspector() {
+  showInspectorInFullscreen.value = !showInspectorInFullscreen.value
+  nextTick(() => {
+    viewerRef.value?.resizeViewer?.()
+  })
+}
+
+// Current Working Roof Model (strictly from verified roof boundary — never a default rectangle)
 const currentRoofModel = ref<RoofModel | null>(null)
+const hasVerifiedRoof = computed(() =>
+  Boolean(currentRoofModel.value && extractVerifiedFootprint2D(currentRoofModel.value).length >= 3)
+)
+
+// Editor-scoped Roof Structure & Slope Parameters (Installer-Provided)
+const editorRoofStructureType = ref<RoofStructureType>('Hip / Pyramid')
+const editorPitchDegrees = ref<number>(15)
+const editorAzimuthDegrees = ref<number>(180)
+const editorRoofThicknessM = ref<number>(0.15)
+const editorEaveHeightM = ref<number>(3.5)
+const roofStructureOptions = ROOF_STRUCTURE_OPTIONS
 
 // ==========================================
 // EDITOR MODES & TOOLS (AutoCAD/SketchUp Style)
@@ -82,7 +133,8 @@ const hiddenObjectTypes = ref<string[]>([])
 // History (Undo / Redo)
 interface DesignSnapshot {
   description: string
-  roofVertices: Array<{ x: number; y: number; z: number }>
+  boundaryLatLng: Array<{ lat: number; lng: number }>
+  mapAreaM2: number
   obstacles: RoofObstacle[]
   panels: PlacedSolarPanel[]
   roofFeatures: RooftopFeature[]
@@ -96,10 +148,10 @@ const historyIndex = ref<number>(-1)
 const isApplyingHistory = ref(false)
 
 // Panels State
-const panelWattageW = ref<number>(550)
-const panelLengthM = ref<number>(2.278)
+const panelWattageW = ref<number>(440)
+const panelLengthM = ref<number>(1.762)
 const panelWidthM = ref<number>(1.134)
-const panelThicknessM = ref<number>(0.04)
+const panelThicknessM = ref<number>(0.030)
 const panelSpacingM = ref<number>(0.05)
 const panelSetbackM = ref<number>(0.5)
 const panelOrientation = ref<'portrait' | 'landscape'>('portrait')
@@ -110,6 +162,70 @@ const inspectorMode = ref<'simple' | 'advanced'>('simple')
 const showAutoArrangeModal = ref<boolean>(false)
 const showClearPanelsModal = ref<boolean>(false)
 const hoverPlacementFeedback = ref<{ isValid: boolean; reason?: string } | null>(null)
+
+// ==========================================
+// SOLAR PANEL BRAND & MODEL SELECTION
+// ==========================================
+const solarPanelBrands = getSolarPanelBrands()
+const selectedPanelBrand = ref<string>('Trina Solar')
+const selectedPanelModelName = ref<string>('Vertex S+ TSM-NEG9R.28 440W')
+
+const availableModelsForBrand = computed<SolarPanelSpecification[]>(() => {
+  if (!selectedPanelBrand.value) return []
+  return getPanelModelsByBrand(selectedPanelBrand.value)
+})
+
+const currentSelectedModelSpec = computed<SolarPanelSpecification | null>(() => {
+  if (!selectedPanelBrand.value || !selectedPanelModelName.value) return null
+  return findPanelModel(selectedPanelBrand.value, selectedPanelModelName.value) || null
+})
+
+function applySelectedModelSpec(spec: SolarPanelSpecification | null) {
+  if (spec) {
+    panelWattageW.value = spec.ratedPowerW ?? 550
+    panelWidthM.value = spec.widthM ?? 1.134
+    panelLengthM.value = spec.heightM ?? 2.278
+    panelThicknessM.value = spec.thicknessM ?? 0.035
+  } else {
+    panelWattageW.value = 550
+    panelWidthM.value = 1.134
+    panelLengthM.value = 2.278
+    panelThicknessM.value = 0.035
+  }
+}
+
+function onBrandChanged() {
+  const models = availableModelsForBrand.value
+  if (models && models.length > 0 && models[0]) {
+    const firstModel = models[0]
+    selectedPanelModelName.value = firstModel.modelName || firstModel.model
+    applySelectedModelSpec(firstModel)
+  } else {
+    selectedPanelModelName.value = ''
+    applySelectedModelSpec(null)
+  }
+}
+
+function onModelChanged() {
+  const spec = currentSelectedModelSpec.value
+  applySelectedModelSpec(spec)
+}
+
+function triggerPlacePanelMode() {
+  activeTool.value = 'add_panel'
+  handleClearSelection()
+}
+
+// Brand breakdown for Solar Array summary (Requirement 11)
+const panelsByManufacturer = computed<Record<string, number>>(() => {
+  const counts: Record<string, number> = {}
+  const panels = currentRoofModel.value?.panels || []
+  for (const p of panels) {
+    const brand = p.manufacturer || 'Generic / Unspecified'
+    counts[brand] = (counts[brand] || 0) + 1
+  }
+  return counts
+})
 
 // Rooftop Feature Creation State (Installer-Controlled Workflow)
 const showAddFeatureModal = ref<boolean>(false)
@@ -198,11 +314,7 @@ const currentSolarData = computed(() => {
   const pos = calculateSolarPosition(lat, lng, targetDate)
   const obs = currentRoofModel.value?.obstacles || []
 
-  const seg = currentRoofModel.value?.roofSegments?.[0]
-  const halfLen = seg?.vertices ? Math.floor(seg.vertices.length / 2) : 0
-  const roofPoly: Array<{ x: number; z: number }> = (seg?.vertices && halfLen >= 3)
-    ? seg.vertices.slice(0, halfLen).map(v => ({ x: v.x, z: v.z }))
-    : (currentRoofModel.value?.geometry?.segments?.[0]?.polygon2D || [])
+  const roofPoly = extractVerifiedFootprint2D(currentRoofModel.value)
 
   const usableArea = (currentGrossAreaM2.value || 0) * 0.8
   const shading = evaluateShadingAssessment(
@@ -214,7 +326,7 @@ const currentSolarData = computed(() => {
     simDate.value,
     formattedSimTime.value,
     'Custom',
-    eaveHeightM.value || 3.5
+    editorEaveHeightM.value || 3.5
   )
   return { pos, shading }
 })
@@ -246,8 +358,13 @@ const pvModules = computed(() => equipment.value.filter(e => e.category === 'PV 
 // ==========================================
 const currentGrossAreaM2 = computed(() => {
   if (!currentRoofModel.value) return 0
-  const segSum = currentRoofModel.value.roofSegments?.reduce((sum, s) => sum + (s.areaM2 || s.areaMeters2 || 0), 0)
-  return Math.round((segSum || currentRoofModel.value.building?.areaM2 || roofAreaSqM.value || 0) * 10) / 10
+  const verifiedArea =
+    currentRoofModel.value.mapAreaM2 ||
+    currentRoofModel.value.areaDiscrepancy?.googleAreaM2 ||
+    currentRoofModel.value.building?.areaM2 ||
+    currentRoofModel.value.footprintAreaM2 ||
+    0
+  return Math.round(verifiedArea * 10) / 10
 })
 
 const obstaclesAreaM2 = computed(() => {
@@ -273,8 +390,10 @@ const currentPanelsCount = computed(() => {
 })
 
 const currentSystemKwp = computed(() => {
-  if (currentPanelsCount.value <= 0) return 0
-  return Number(((currentPanelsCount.value * panelWattageW.value) / 1000).toFixed(2))
+  const panels = currentRoofModel.value?.panels || []
+  if (panels.length === 0) return 0
+  const totalWatts = panels.reduce((sum, p) => sum + (p.wattageW || panelWattageW.value || 550), 0)
+  return Number((totalWatts / 1000).toFixed(2))
 })
 
 const estimatedAnnualEnergyKwh = computed(() => {
@@ -326,67 +445,96 @@ const designValidation = computed(() => {
 // ==========================================
 // INITIALIZATION & LIFECYCLE
 // ==========================================
+function syncEditorControlsFromModel(model: RoofModel) {
+  const seg = model.segments?.[0] || model.roofSegments?.[0]
+  editorRoofStructureType.value = normalizeRoofStructureType(
+    model.roofType || seg?.roofType || model.building?.roofType,
+    extractVerifiedFootprint2D(model, seg)
+  )
+  editorPitchDegrees.value = model.pitchDegrees ?? seg?.pitchDegrees ?? 15
+  editorAzimuthDegrees.value = model.azimuthDegrees ?? seg?.azimuthDegrees ?? 180
+  editorRoofThicknessM.value = model.roofThicknessM ?? seg?.roofThicknessM ?? 0.15
+  editorEaveHeightM.value = model.eaveHeightM ?? seg?.eaveHeightM ?? model.origin?.elevation ?? 3.5
+}
+
+function snapAllPlacedObjectsToCurrentRoof() {
+  if (!currentRoofModel.value) return
+
+  if (currentRoofModel.value.panels && currentRoofModel.value.panels.length > 0) {
+    currentRoofModel.value.panels.forEach(p => {
+      snapPanelToRoofSurface(p, currentRoofModel.value)
+      validateSinglePanel(p)
+    })
+  }
+
+  if (currentRoofModel.value.roofFeatures && currentRoofModel.value.roofFeatures.length > 0) {
+    currentRoofModel.value.roofFeatures.forEach(f => {
+      let posX = f.position?.x
+      let posZ = f.position?.z
+      if ((posX === undefined || posZ === undefined) && f.latitude && f.longitude) {
+        const centerLat = currentRoofModel.value?.origin?.latitude || 6.7497
+        const centerLng = currentRoofModel.value?.origin?.longitude || 125.3572
+        const local = latLngToLocalMeters(f.latitude, f.longitude, centerLat, centerLng)
+        posX = local.x
+        posZ = local.z
+      }
+      if (posX !== undefined && posZ !== undefined) {
+        const surf = getRoofSurfaceAtLocalPoint(posX, posZ, currentRoofModel.value)
+        if (!f.position) f.position = { x: posX, y: surf.y, z: posZ }
+        f.position.x = posX
+        f.position.y = surf.y
+        f.position.z = posZ
+        f.normal = [surf.normal.x, surf.normal.y, surf.normal.z]
+        f.tiltPitchDeg = surf.pitchDeg
+        f.roofSegmentId = surf.segmentId
+        f.segmentIndex = surf.segmentIndex
+      }
+    })
+  }
+}
+
 onMounted(async () => {
-  if (activeProject.value?.roofModel) {
-    currentRoofModel.value = JSON.parse(JSON.stringify(activeProject.value.roofModel))
-  } else if (activeRoofModel.value) {
-    currentRoofModel.value = JSON.parse(JSON.stringify(activeRoofModel.value))
+  let candidateModel: RoofModel | null = null
+
+  const projModel = activeProject.value?.roofModel || null
+  const memModel = activeRoofModel.value || null
+
+  if (projModel && memModel && (!activeProject.value || memModel.projectId === activeProject.value.id)) {
+    const tProj = Date.parse(projModel.updatedAt || '') || 0
+    const tMem = Date.parse(memModel.updatedAt || '') || 0
+    candidateModel = tMem >= tProj ? memModel : projModel
+  } else if (projModel) {
+    candidateModel = projModel
+  } else if (memModel && !activeProject.value) {
+    candidateModel = memModel
   } else {
     const pid = activeProject.value?.id || 'current-project'
     try {
       const res = await $fetch<{ success: boolean; data?: RoofModel }>(`/api/roofs/model?projectId=${pid}`)
       if (res && res.success && res.data) {
-        currentRoofModel.value = res.data
-        if (activeProject.value) {
-          updateProject(activeProject.value.id, { roofModel: res.data })
-        }
+        candidateModel = res.data
       }
     } catch {
       // Server store empty
     }
   }
 
-  // Ensure data arrays exist strictly data-driven (no demo objects! Requirement 23)
+  // Upgrade any legacy v1 model into canonical v2 multi-plane 3D roof (returns null if no verified roof polygon)
+  const upgraded = hydrateOrUpgradeRoofModel(candidateModel)
+  currentRoofModel.value = upgraded
+
   if (currentRoofModel.value) {
     if (!currentRoofModel.value.obstacles) currentRoofModel.value.obstacles = []
     if (!currentRoofModel.value.panels) currentRoofModel.value.panels = []
     if (!currentRoofModel.value.roofFeatures) currentRoofModel.value.roofFeatures = []
 
-    // Re-snap any saved panels to exact roof surface geometry (Requirement 16)
-    if (currentRoofModel.value.panels.length > 0) {
-      currentRoofModel.value.panels.forEach(p => {
-        const surf = getRoofSurfaceAtLocalPoint(p.x, p.z, currentRoofModel.value)
-        p.y = Number((surf.y + DEFAULT_MOUNTING_CLEARANCE_M).toFixed(4))
-        p.normal = [surf.normal.x, surf.normal.y, surf.normal.z]
-        p.tiltPitchDeg = surf.pitchDeg
-        validateSinglePanel(p)
-      })
-    }
+    syncEditorControlsFromModel(currentRoofModel.value)
+    snapAllPlacedObjectsToCurrentRoof()
 
-    // Re-snap any saved rooftop features to exact roof surface geometry (Requirement 22)
-    if (currentRoofModel.value.roofFeatures.length > 0) {
-      currentRoofModel.value.roofFeatures.forEach(f => {
-        let posX = f.position?.x
-        let posZ = f.position?.z
-        if ((posX === undefined || posZ === undefined) && f.latitude && f.longitude) {
-          const centerLat = currentRoofModel.value?.origin?.latitude || 6.7497
-          const centerLng = currentRoofModel.value?.origin?.longitude || 125.3572
-          const local = latLngToLocalMeters(f.latitude, f.longitude, centerLat, centerLng)
-          posX = local.x
-          posZ = local.z
-        }
-        if (posX !== undefined && posZ !== undefined) {
-          const surf = getRoofSurfaceAtLocalPoint(posX, posZ, currentRoofModel.value)
-          if (!f.position) f.position = { x: posX, y: surf.y, z: posZ }
-          f.position.x = posX
-          f.position.y = surf.y
-          f.position.z = posZ
-          f.normal = [surf.normal.x, surf.normal.y, surf.normal.z]
-          f.tiltPitchDeg = surf.pitchDeg
-          f.roofSegmentId = surf.segmentId
-          f.segmentIndex = surf.segmentIndex
-        }
-      })
+    // Keep composable & project store synchronized so Map Area and Babylon Footprint match everywhere
+    hydrateStateFromProjectModel(currentRoofModel.value)
+    if (activeProject.value) {
+      updateProject(activeProject.value.id, { roofModel: currentRoofModel.value })
     }
 
     if (currentRoofModel.value.verification?.status === 'Verified') {
@@ -402,10 +550,17 @@ onMounted(async () => {
     if (currentRoofModel.value.verification?.notes) {
       verificationNotes.value = currentRoofModel.value.verification.notes
     }
+
+    // Push initial snapshot without marking unsaved changes
+    recordHistorySnapshot('Initial Design State')
+    hasUnsavedChanges.value = false
   }
 
-  // Push initial snapshot
-  recordHistorySnapshot('Initial Design State')
+  // Synchronize initial solar panel specification
+  const initialSpec = findPanelModel(selectedPanelBrand.value, selectedPanelModelName.value)
+  if (initialSpec) {
+    applySelectedModelSpec(initialSpec)
+  }
 
   // Register Global Keyboard Shortcuts
   window.addEventListener('keydown', handleKeyDown)
@@ -424,21 +579,26 @@ onBeforeUnmount(() => {
 function recordHistorySnapshot(desc: string) {
   if (isApplyingHistory.value || !currentRoofModel.value) return
 
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  const vertices = seg?.vertices ? JSON.parse(JSON.stringify(seg.vertices)) : []
+  const boundaryLatLng = extractVerifiedBoundaryLatLng(currentRoofModel.value)
+  const mapAreaM2 =
+    currentRoofModel.value.mapAreaM2 ||
+    currentRoofModel.value.areaDiscrepancy?.googleAreaM2 ||
+    currentRoofModel.value.building?.areaM2 ||
+    computeSphericalPolygonAreaM2(boundaryLatLng)
   const obstacles = JSON.parse(JSON.stringify(currentRoofModel.value.obstacles || []))
   const panels = JSON.parse(JSON.stringify(currentRoofModel.value.panels || []))
   const roofFeatures = JSON.parse(JSON.stringify(currentRoofModel.value.roofFeatures || []))
 
   const snap: DesignSnapshot = {
     description: desc,
-    roofVertices: vertices,
+    boundaryLatLng,
+    mapAreaM2,
     obstacles,
     panels,
     roofFeatures,
-    pitch: roofPitchDegrees.value,
-    azimuth: roofAzimuthDegrees.value,
-    structureType: roofStructureType.value
+    pitch: editorPitchDegrees.value,
+    azimuth: editorAzimuthDegrees.value,
+    structureType: editorRoofStructureType.value
   }
 
   // Truncate any redo branch
@@ -469,16 +629,22 @@ function applySnapshot(snap: DesignSnapshot) {
   if (!currentRoofModel.value) return
   isApplyingHistory.value = true
 
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  if (seg && snap.roofVertices.length > 0) {
-    seg.vertices = JSON.parse(JSON.stringify(snap.roofVertices))
-  }
+  editorPitchDegrees.value = snap.pitch
+  editorAzimuthDegrees.value = snap.azimuth
+  editorRoofStructureType.value = snap.structureType
   currentRoofModel.value.obstacles = JSON.parse(JSON.stringify(snap.obstacles))
   currentRoofModel.value.panels = JSON.parse(JSON.stringify(snap.panels))
   currentRoofModel.value.roofFeatures = JSON.parse(JSON.stringify(snap.roofFeatures || []))
-  roofPitchDegrees.value = snap.pitch
-  roofAzimuthDegrees.value = snap.azimuth
-  roofStructureType.value = snap.structureType
+
+  if (snap.boundaryLatLng && snap.boundaryLatLng.length >= 3) {
+    currentRoofModel.value.boundaryLatLng = JSON.parse(JSON.stringify(snap.boundaryLatLng))
+    if (currentRoofModel.value.segments?.[0]) {
+      currentRoofModel.value.segments[0].boundaryLatLng = JSON.parse(JSON.stringify(snap.boundaryLatLng))
+    }
+    currentRoofModel.value.mapAreaM2 = snap.mapAreaM2
+  }
+
+  recalculateRoofBoundaryGeometry(false)
 
   setTimeout(() => {
     isApplyingHistory.value = false
@@ -581,65 +747,97 @@ function handleObjectTransformed(payload: {
 
 function handleVertexMoved(payload: { vertexIndex: number; x: number; z: number }) {
   if (!currentRoofModel.value) return
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  if (!seg || !seg.vertices || !seg.vertices[payload.vertexIndex]) return
+  const fp2D = extractVerifiedFootprint2D(currentRoofModel.value).map(pt => ({ ...pt }))
+  if (!fp2D[payload.vertexIndex]) return
 
-  const v = seg.vertices[payload.vertexIndex]
-  if (v) {
-    v.x = payload.x
-    v.z = payload.z
+  fp2D[payload.vertexIndex] = { x: payload.x, z: payload.z }
+
+  const originLat = currentRoofModel.value.origin?.latitude || 6.7497
+  const originLng = currentRoofModel.value.origin?.longitude || 125.3572
+  const rawLatLng = fp2D.map(pt => localMetersToLatLng(pt.x, pt.z, originLat, originLng))
+  const ordered = orderRoofPolygonVertices(rawLatLng)
+
+  if (!ordered.validation.isValid) {
+    saveFeedback.value = ordered.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+    return
   }
 
-  // Also update corresponding bottom thickness vertex if exists
-  const halfLen = Math.floor(seg.vertices.length / 2)
-  const bottomIdx = payload.vertexIndex + halfLen
-  if (seg.vertices[bottomIdx]) {
-    seg.vertices[bottomIdx]!.x = payload.x
-    seg.vertices[bottomIdx]!.z = payload.z
+  const updatedLatLng = ordered.points
+  const orderedFp2D = updatedLatLng.map(pt => latLngToLocalMeters(pt.lat, pt.lng, originLat, originLng))
+  const updatedMapArea = computeSphericalPolygonAreaM2(updatedLatLng)
+
+  currentRoofModel.value.footprint2D = orderedFp2D
+  currentRoofModel.value.boundaryLatLng = updatedLatLng
+  currentRoofModel.value.mapAreaM2 = updatedMapArea
+  if (currentRoofModel.value.segments?.[0]) {
+    currentRoofModel.value.segments[0].footprint2D = orderedFp2D
+    currentRoofModel.value.segments[0].boundaryLatLng = updatedLatLng
+  }
+  if (currentRoofModel.value.roofSegments?.[0]) {
+    currentRoofModel.value.roofSegments[0].footprint2D = orderedFp2D
+    currentRoofModel.value.roofSegments[0].boundaryLatLng = updatedLatLng
   }
 
-  // Rebuild polygon area & geometry
-  recalculateRoofBoundaryGeometry()
+  recalculateRoofBoundaryGeometry(false)
   recordHistorySnapshot(`Adjusted Roof Vertex #${payload.vertexIndex + 1}`)
 }
 
-function recalculateRoofBoundaryGeometry() {
+function recalculateRoofBoundaryGeometry(fitCamera = false) {
   if (!currentRoofModel.value) return
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  if (!seg || !seg.vertices) return
+  const latLngPoints = extractVerifiedBoundaryLatLng(currentRoofModel.value)
+  if (latLngPoints.length < 3) return
 
-  const halfLen = Math.floor(seg.vertices.length / 2)
-  const topPoints = seg.vertices.slice(0, halfLen).map(v => ({ x: v.x, z: v.z }))
+  const originLat = currentRoofModel.value.origin?.latitude
+  const originLng = currentRoofModel.value.origin?.longitude
+  const mapAreaM2 =
+    currentRoofModel.value.mapAreaM2 ||
+    currentRoofModel.value.areaDiscrepancy?.googleAreaM2 ||
+    currentRoofModel.value.building?.areaM2 ||
+    computeSphericalPolygonAreaM2(latLngPoints)
 
-  const centerLat = currentRoofModel.value.origin?.latitude || 6.7497
-  const centerLng = currentRoofModel.value.origin?.longitude || 125.3572
-  const latLngPoints = topPoints.map(pt => localMetersToLatLng(pt.x, pt.z, centerLat, centerLng))
-
-  const areaM2 = currentGrossAreaM2.value || seg.areaM2 || seg.areaMeters2 || 0
-  const newGeo = buildExactRoofGeometry(latLngPoints, areaM2, {
-    pitchDegrees: roofPitchDegrees.value,
-    azimuthDegrees: roofAzimuthDegrees.value,
-    eaveHeightM: eaveHeightM.value,
-    roofThicknessM: roofThicknessM.value,
-    roofType: roofStructureType.value
+  const newGeo = buildExactRoofGeometry(latLngPoints, mapAreaM2, {
+    pitchDegrees: editorPitchDegrees.value,
+    azimuthDegrees: editorAzimuthDegrees.value,
+    eaveHeightM: editorEaveHeightM.value,
+    roofThicknessM: editorRoofThicknessM.value,
+    roofType: editorRoofStructureType.value,
+    originLat,
+    originLng
   })
 
-  seg.vertices = newGeo.vertices
-  seg.indices = newGeo.indices
-  seg.normals = newGeo.normals
-  seg.areaM2 = newGeo.footprintAreaM2
-  seg.areaMeters2 = newGeo.footprintAreaM2
+  editorRoofStructureType.value = newGeo.roofType
 
-  // Re-snap all existing panels to updated roof geometry
-  if (currentRoofModel.value.panels && currentRoofModel.value.panels.length > 0) {
-    currentRoofModel.value.panels.forEach(p => {
-      const surf = getRoofSurfaceAtLocalPoint(p.x, p.z, currentRoofModel.value)
-      p.y = Number((surf.y + DEFAULT_MOUNTING_CLEARANCE_M).toFixed(4))
-      p.normal = [surf.normal.x, surf.normal.y, surf.normal.z]
-      p.tiltPitchDeg = surf.pitchDeg
-      validateSinglePanel(p)
-    })
+  applyGeneratedGeometryToRoofModel(currentRoofModel.value, newGeo, {
+    pitchDegrees: editorPitchDegrees.value,
+    azimuthDegrees: editorAzimuthDegrees.value,
+    eaveHeightM: editorEaveHeightM.value,
+    roofThicknessM: editorRoofThicknessM.value,
+    structureVerifiedByInstaller: true
+  })
+
+  // Re-snap all placed panels & rooftop features onto the regenerated multi-plane sloped facets
+  snapAllPlacedObjectsToCurrentRoof()
+
+  // Trigger Vue shallow/deep reactivity cleanly for BabylonRoofViewer
+  currentRoofModel.value = { ...currentRoofModel.value }
+  activeRoofModel.value = currentRoofModel.value
+  hasUnsavedChanges.value = true
+
+  if (fitCamera) {
+    setTimeout(() => {
+      viewerRef.value?.fitCameraToRoof()
+    }, 30)
   }
+}
+
+function onRoofStructureChanged() {
+  recalculateRoofBoundaryGeometry(true)
+  recordHistorySnapshot(`Changed Roof Structure to ${editorRoofStructureType.value}`)
+}
+
+function onRoofSlopeChanged() {
+  recalculateRoofBoundaryGeometry(false)
+  recordHistorySnapshot(`Updated Pitch ${editorPitchDegrees.value}° / Azimuth ${editorAzimuthDegrees.value}°`)
 }
 
 // ==========================================
@@ -713,18 +911,27 @@ function handlePlaceObject(payload: { type: 'tree' | 'obstruction' | 'panel'; su
     const isLandscape = (payload as any).orientation === 'landscape' || panelOrientation.value === 'landscape'
     const rotY = isLandscape ? ((surf.azimuthDeg * Math.PI) / 180 + Math.PI / 2) : ((surf.azimuthDeg * Math.PI) / 180)
 
+    const spec = currentSelectedModelSpec.value
+    const w = spec?.widthM ?? panelWidthM.value
+    const l = spec?.heightM ?? panelLengthM.value
+    const th = spec?.thicknessM ?? panelThicknessM.value
+    const pwr = spec?.ratedPowerW ?? panelWattageW.value
+
     const newPanel: PlacedSolarPanel = {
       id: pId,
       x: payload.x,
       y: Number((surf.y + DEFAULT_MOUNTING_CLEARANCE_M).toFixed(4)),
       z: payload.z,
-      widthM: panelWidthM.value,
-      lengthM: panelLengthM.value,
-      thicknessM: panelThicknessM.value,
+      widthM: w,
+      lengthM: l,
+      thicknessM: th,
       rotationY: rotY,
       tiltPitchDeg: surf.pitchDeg,
       normal: [surf.normal.x, surf.normal.y, surf.normal.z],
-      wattageW: panelWattageW.value,
+      wattageW: pwr,
+      manufacturer: spec?.manufacturer || selectedPanelBrand.value,
+      modelName: spec?.modelName || selectedPanelModelName.value,
+      efficiencyPercent: spec?.efficiencyPercent,
       status: 'VALID'
     }
 
@@ -734,7 +941,7 @@ function handlePlaceObject(payload: { type: 'tree' | 'obstruction' | 'panel'; su
     selectedObjectType.value = 'panel'
     selectedObjectData.value = newPanel
     activeTool.value = 'select'
-    recordHistorySnapshot(`Added Panel ${pId}`)
+    recordHistorySnapshot(`Added ${newPanel.manufacturer || 'Solar'} Panel ${pId}`)
   }
 }
 
@@ -1057,11 +1264,8 @@ function handleAutoArrangePanels() {
 function confirmAutoArrange() {
   showAutoArrangeModal.value = false
   if (!currentRoofModel.value) return
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  if (!seg || !seg.vertices || seg.vertices.length < 3) return
-
-  const halfLen = Math.floor(seg.vertices.length / 2)
-  const roofPoly = seg.vertices.slice(0, halfLen).map(v => ({ x: v.x, z: v.z }))
+  const roofPoly = extractVerifiedFootprint2D(currentRoofModel.value)
+  if (roofPoly.length < 3) return
 
   const config: PanelPlacementConfig = {
     panelWidthM: panelWidthM.value,
@@ -1070,9 +1274,9 @@ function confirmAutoArrange() {
     setbackM: panelSetbackM.value,
     panelSpacingM: panelSpacingM.value,
     orientation: panelOrientation.value,
-    pitchDegrees: roofPitchDegrees.value,
-    azimuthDegrees: roofAzimuthDegrees.value,
-    eaveHeightM: eaveHeightM.value
+    pitchDegrees: editorPitchDegrees.value,
+    azimuthDegrees: editorAzimuthDegrees.value,
+    eaveHeightM: editorEaveHeightM.value
   }
 
   const shadows = currentSolarData.value?.shading?.shadowPolygons || []
@@ -1089,12 +1293,14 @@ function confirmAutoArrange() {
     currentRoofModel.value.roofFeatures || []
   )
 
-  // Mathematically snap every auto-arranged panel to the exact 3D roof surface
+  // Mathematically snap every auto-arranged panel to its exact multi-plane 3D roof facet
+  const spec = currentSelectedModelSpec.value
   result.placedPanels.forEach(p => {
-    const surf = getRoofSurfaceAtLocalPoint(p.x, p.z, currentRoofModel.value)
-    p.y = Number((surf.y + DEFAULT_MOUNTING_CLEARANCE_M).toFixed(4))
-    p.normal = [surf.normal.x, surf.normal.y, surf.normal.z]
-    p.tiltPitchDeg = surf.pitchDeg
+    p.manufacturer = spec?.manufacturer || selectedPanelBrand.value
+    p.modelName = spec?.modelName || selectedPanelModelName.value
+    p.efficiencyPercent = spec?.efficiencyPercent
+    p.thicknessM = spec?.thicknessM || panelThicknessM.value
+    snapPanelToRoofSurface(p, currentRoofModel.value)
   })
 
   currentRoofModel.value.panels = result.placedPanels
@@ -1103,11 +1309,8 @@ function confirmAutoArrange() {
 
 function validateSinglePanel(panel: PlacedSolarPanel) {
   if (!currentRoofModel.value) return
-  const seg = currentRoofModel.value.roofSegments?.[0]
-  if (!seg || !seg.vertices) return
-
-  const halfLen = Math.floor(seg.vertices.length / 2)
-  const roofPoly = seg.vertices.slice(0, halfLen).map(v => ({ x: v.x, z: v.z }))
+  const roofPoly = extractVerifiedFootprint2D(currentRoofModel.value)
+  if (roofPoly.length < 3) return
 
   const shadows = currentSolarData.value?.shading?.shadowPolygons || []
   const shadowExclusions = shadows.map(s => ({
@@ -1166,14 +1369,26 @@ async function handleSaveDesign() {
   try {
     const result = await saveVerifiedRoofModel(currentRoofModel.value, verificationNotes.value)
     if (result && result.data) {
-      currentRoofModel.value = result.data
+      currentRoofModel.value = hydrateOrUpgradeRoofModel(result.data) || result.data
     }
 
-    if (activeProject.value) {
+    hydrateStateFromProjectModel(currentRoofModel.value)
+
+    if (activeProject.value && currentRoofModel.value) {
       updateProject(activeProject.value.id, {
         status: isVerified.value ? 'Solar Analysis' : 'Roof Verification',
         currentStep: Math.max(activeProject.value.currentStep, isVerified.value ? 4 : 3),
         roofModel: currentRoofModel.value,
+        roofVerification: {
+          ...activeProject.value.roofVerification,
+          status: isVerified.value ? 'Verified' : 'Requires Review',
+          confidence: 'INSTALLER VERIFIED',
+          roofType: editorRoofStructureType.value as any,
+          verifiedPitchDeg: editorPitchDegrees.value,
+          verifiedAreaM2: currentGrossAreaM2.value,
+          usableAreaM2: currentUsableAreaM2.value,
+          segments: (currentRoofModel.value.segments || []) as any
+        },
         systemSizing: {
           ...activeProject.value.systemSizing,
           moduleCount: currentPanelsCount.value,
@@ -1205,23 +1420,32 @@ function handleSaveVerifiedDesign() {
   handleSaveDesign()
 }
 
-function handleExitEditor() {
+async function exitFullscreenBeforeNavigate() {
+  if (import.meta.client && typeof document !== 'undefined' && document.fullscreenElement) {
+    try {
+      await document.exitFullscreen()
+    } catch {
+      // Ignore fullscreen exit errors when navigating away
+    }
+  }
+}
+
+async function handleExitEditor() {
   if (hasUnsavedChanges.value) {
     showExitModal.value = true
   } else {
+    await exitFullscreenBeforeNavigate()
     navigateTo('/site-assessment')
   }
 }
 
-function handleConfirmExit(saveFirst: boolean) {
+async function handleConfirmExit(saveFirst: boolean) {
   showExitModal.value = false
   if (saveFirst) {
-    handleSaveDesign().then(() => {
-      navigateTo('/site-assessment')
-    })
-  } else {
-    navigateTo('/site-assessment')
+    await handleSaveDesign()
   }
+  await exitFullscreenBeforeNavigate()
+  navigateTo('/site-assessment')
 }
 
 // ==========================================
@@ -1262,6 +1486,21 @@ function handleKeyDown(e: KeyboardEvent) {
     e.preventDefault()
     handleDuplicateSelected()
   } else if (e.key === 'Escape') {
+    if (showAddFeatureModal.value) {
+      showAddFeatureModal.value = false
+      pendingFeatureLocation.value = null
+      return
+    }
+    if (showAutoArrangeModal.value || showClearPanelsModal.value || showHelpModal.value || showExitModal.value) {
+      showAutoArrangeModal.value = false
+      showClearPanelsModal.value = false
+      showHelpModal.value = false
+      showExitModal.value = false
+      return
+    }
+    if (isViewerFullscreen.value || (typeof document !== 'undefined' && document.fullscreenElement)) {
+      return
+    }
     activeTool.value = 'select'
     handleClearSelection()
   } else if (e.key === 'f' || e.key === 'F') {
@@ -1283,7 +1522,9 @@ const activeToolPrompt = computed(() => {
     case 'add_obstruction':
       return `Choose an obstruction, then click the site to place it.`
     case 'add_panel':
-      return 'Click on the roof to place a solar panel.'
+      return selectedPanelModelName.value
+        ? `Click on roof to place ${selectedPanelBrand.value} ${selectedPanelModelName.value} (${panelWattageW.value}W).`
+        : 'Select brand & model, then click on the roof to place panel.'
     case 'measure':
       return 'Click two points to measure distance.'
     case 'sun_sim':
@@ -1295,13 +1536,19 @@ const activeToolPrompt = computed(() => {
 </script>
 
 <template>
-  <div class="h-[calc(100vh-64px)] w-full flex flex-col bg-slate-950 text-slate-100 overflow-hidden font-sans">
+  <div
+    ref="rooftopFullscreenRef"
+    :class="[
+      isViewerFullscreen ? 'h-full w-full' : 'h-screen w-full',
+      'max-w-full flex flex-col bg-slate-950 text-slate-100 overflow-hidden font-sans'
+    ]"
+  >
     <!-- ========================================== -->
     <!-- TOP TOOLBAR: HELIOS-LOAD SOLAR DESIGN EDITOR -->
     <!-- ========================================== -->
-    <header class="h-14 bg-slate-900 border-b border-slate-800 px-4 flex items-center justify-between gap-3 shrink-0 z-20">
+    <header class="min-h-12 py-1.5 bg-slate-900 border-b border-slate-800 px-3 flex flex-wrap items-center justify-between gap-2 shrink-0 z-20 max-w-full">
       <!-- Title & Project Context -->
-      <div class="flex items-center gap-3">
+      <div class="flex items-center gap-2.5 shrink-0">
         <div class="flex items-center gap-2">
           <div class="w-7 h-7 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-xs shadow-md">
             ☀️
@@ -1310,24 +1557,24 @@ const activeToolPrompt = computed(() => {
             <h1 class="text-xs font-black tracking-wider uppercase text-white leading-tight">
               HELIOS-LOAD SOLAR DESIGN EDITOR
             </h1>
-            <p class="text-[10px] text-slate-400 font-mono">
+            <p class="hidden 2xl:block text-[10px] text-slate-400 font-mono">
               {{ activeProject?.name || 'Digos City Solar Project' }} | CAD Workspace
             </p>
           </div>
         </div>
 
-        <div class="h-4 w-px bg-slate-800"></div>
+        <div class="hidden xl:block h-4 w-px bg-slate-800"></div>
 
         <!-- Mode Indicator -->
-        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-900/60 text-cyan-300 border border-blue-700/50 uppercase font-mono">
+        <span class="hidden xl:inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-blue-900/60 text-cyan-300 border border-blue-700/50 uppercase font-mono">
           TOOL: {{ activeTool.replace('_', ' ') }}
         </span>
       </div>
 
       <!-- Center Action Buttons Toolbar -->
-      <div class="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
+      <div class="flex flex-wrap items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 max-w-full">
         <!-- Tools Group -->
-        <div class="flex items-center gap-0.5">
+        <div class="flex flex-wrap items-center gap-0.5">
           <button
             type="button"
             @click="activeTool = 'select'"
@@ -1395,12 +1642,12 @@ const activeToolPrompt = computed(() => {
 
           <button
             type="button"
-            @click="activeTool = 'add_panel'"
+            @click="triggerPlacePanelMode"
             :class="[
               'px-2.5 py-1.5 text-xs font-bold rounded-lg transition-colors flex items-center gap-1',
               activeTool === 'add_panel' ? 'bg-cyan-600 text-white shadow-sm' : 'text-slate-400 hover:text-white hover:bg-slate-800'
             ]"
-            title="Manually Place Solar PV Panel"
+            title="Select & Place Solar PV Panel Brand & Model"
           >
             <span>⚡</span>
             <span>PANEL</span>
@@ -1624,31 +1871,54 @@ const activeToolPrompt = computed(() => {
     <!-- ========================================== -->
     <!-- MAIN WORKSPACE: LEFT TREE, CENTER BABYLON, RIGHT INSPECTOR -->
     <!-- ========================================== -->
-    <div class="flex-1 flex overflow-hidden">
+    <div class="flex-1 flex overflow-hidden min-h-0 min-w-0">
       <!-- LEFT SIDEBAR: Object Hierarchy & Scene Tree (AutoCAD/SketchUp Style) -->
-      <aside class="w-64 bg-slate-900/95 border-r border-slate-800 flex flex-col shrink-0 z-10 text-xs">
-        <div class="p-3 border-b border-slate-800 flex items-center justify-between">
+      <aside
+        v-show="!isViewerFullscreen || showHierarchyInFullscreen"
+        :class="[
+          isViewerFullscreen ? 'flex w-60' : 'hidden lg:flex w-60 xl:w-64',
+          'bg-slate-900/95 border-r border-slate-800 flex-col shrink-0 z-10 text-xs'
+        ]"
+      >
+        <div class="p-3 border-b border-slate-800 flex items-center justify-between gap-2">
           <span class="font-bold uppercase tracking-wider text-slate-400 text-[10px]">SCENE HIERARCHY</span>
-          <span class="font-mono text-[10px] text-slate-500">
-            {{ (currentRoofModel?.obstacles?.length || 0) + currentPanelsCount + currentRoofFeaturesCount + 1 }} Objects
-          </span>
+          <div class="flex items-center gap-2">
+            <span class="font-mono text-[10px] text-slate-500">
+              {{ (currentRoofModel?.obstacles?.length || 0) + currentPanelsCount + currentRoofFeaturesCount + 1 }} Objects
+            </span>
+            <button
+              v-if="isViewerFullscreen"
+              type="button"
+              @click="toggleFullscreenHierarchy"
+              title="Collapse Scene Hierarchy"
+              class="text-slate-400 hover:text-white px-1 py-0.5 rounded hover:bg-slate-800 text-[10px] font-bold cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         <div class="flex-1 overflow-y-auto p-2 space-y-3">
           <!-- Roof Group -->
           <div class="space-y-1">
             <div
-              @click="handleSelectObject({ id: currentRoofModel?.roofSegments?.[0]?.id || 'seg-0', type: 'roof' })"
+              @click="hasVerifiedRoof && handleSelectObject({ id: currentRoofModel?.segments?.[0]?.id || currentRoofModel?.roofSegments?.[0]?.id || 'seg-0', type: 'roof' })"
               :class="[
-                'p-2 rounded-lg flex items-center justify-between cursor-pointer transition-colors',
-                selectedObjectType === 'roof' ? 'bg-blue-900/50 border border-blue-500/50 text-white' : 'hover:bg-slate-800/60 text-slate-300'
+                'p-2 rounded-lg flex items-center justify-between transition-colors',
+                !hasVerifiedRoof
+                  ? 'opacity-60 cursor-not-allowed text-slate-500'
+                  : selectedObjectType === 'roof'
+                    ? 'bg-blue-900/50 border border-blue-500/50 text-white cursor-pointer'
+                    : 'hover:bg-slate-800/60 text-slate-300 cursor-pointer'
               ]"
             >
               <div class="flex items-center gap-1.5">
                 <span>🏠</span>
                 <span class="font-semibold">Roof Footprint</span>
               </div>
-              <span class="font-mono text-[10px] text-slate-400">{{ currentGrossAreaM2 }} m²</span>
+              <span class="font-mono text-[10px] text-slate-400">
+                {{ hasVerifiedRoof ? `${currentGrossAreaM2} m²` : 'Unverified' }}
+              </span>
             </div>
           </div>
 
@@ -1778,13 +2048,27 @@ const activeToolPrompt = computed(() => {
               0 panels placed. Click "Auto Arrange" or "Panel" tool to place.
             </div>
 
-            <div v-else key="panels-summary" class="bg-slate-950 p-2 rounded-lg border border-slate-800 text-[11px] space-y-1 font-mono">
+            <div v-else key="panels-summary" class="bg-slate-950 p-2 rounded-lg border border-slate-800 text-[11px] space-y-1.5 font-mono">
               <div class="flex justify-between text-slate-400">
-                <span>Panels:</span>
+                <span>Total Panels:</span>
                 <span class="font-bold text-white">{{ currentPanelsCount }} modules</span>
               </div>
-              <div class="flex justify-between text-slate-400">
-                <span>Capacity:</span>
+
+              <!-- Breakdown by brand (Requirement 11) -->
+              <div v-if="Object.keys(panelsByManufacturer).length > 0" class="pt-1 border-t border-slate-800/80 space-y-1">
+                <div class="text-[10px] text-slate-500 font-sans uppercase font-bold">Brand Breakdown:</div>
+                <div
+                  v-for="(count, brand) in panelsByManufacturer"
+                  :key="brand"
+                  class="flex justify-between text-slate-300 pl-1"
+                >
+                  <span class="truncate pr-1">{{ brand }}:</span>
+                  <span class="font-bold text-cyan-300">{{ count }}</span>
+                </div>
+              </div>
+
+              <div class="pt-1 border-t border-slate-800/80 flex justify-between text-slate-400">
+                <span>Total DC Capacity:</span>
                 <span class="font-bold text-emerald-400">{{ currentSystemKwp }} kWp</span>
               </div>
               <div class="flex justify-between text-slate-400">
@@ -1792,15 +2076,49 @@ const activeToolPrompt = computed(() => {
                 <span class="font-bold text-blue-300">{{ estimatedAnnualEnergyKwh.toLocaleString() }} kWh/yr</span>
               </div>
             </div>
+
+            <!-- Placed panels list with brand name -->
+            <div v-if="currentPanelsCount > 0" class="space-y-1 pt-1 max-h-48 overflow-y-auto">
+              <div
+                v-for="p in currentRoofModel?.panels || []"
+                :key="p.id"
+                @click="handleSelectObject({ id: p.id, type: 'panel', rawData: p })"
+                :class="[
+                  'p-1.5 px-2 rounded-md flex items-center justify-between cursor-pointer transition-colors text-[11px]',
+                  selectedObjectId === p.id ? 'bg-cyan-950/70 border border-cyan-500/50 text-cyan-200' : 'hover:bg-slate-800 text-slate-300'
+                ]"
+              >
+                <div class="flex items-center gap-1.5 truncate">
+                  <span>⚡</span>
+                  <span class="font-mono font-bold">{{ p.id }}</span>
+                  <span class="text-[10px] text-slate-400 truncate">({{ p.manufacturer || 'Solar' }})</span>
+                </div>
+                <span class="text-[10px] font-mono text-emerald-400 shrink-0">{{ p.wattageW }}W</span>
+              </div>
+            </div>
           </div>
         </div>
       </aside>
 
       <!-- CENTER: BABYLON.JS 3D VIEWPORT -->
-      <main class="flex-1 flex flex-col min-w-0 relative bg-slate-950">
+      <main class="flex-1 flex flex-col min-w-0 min-h-0 relative bg-slate-950">
         <!-- Interactive Tool Guidance Banner -->
-        <div class="bg-slate-900/90 border-b border-slate-800 px-4 py-1.5 flex items-center justify-between text-xs z-10 shrink-0">
-          <div class="flex items-center gap-2">
+        <div class="bg-slate-900/90 border-b border-slate-800 px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 text-xs z-10 shrink-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-if="isViewerFullscreen"
+              type="button"
+              @click="toggleFullscreenHierarchy"
+              :class="[
+                'px-2 py-0.5 text-[10px] font-bold rounded border transition-colors cursor-pointer',
+                showHierarchyInFullscreen
+                  ? 'bg-blue-600/80 text-white border-blue-500'
+                  : 'bg-slate-950 text-slate-300 hover:text-white border-slate-700'
+              ]"
+              title="Toggle Scene Hierarchy Panel"
+            >
+              ☰ HIERARCHY
+            </button>
             <span class="font-mono text-cyan-400 font-bold uppercase text-[10px]">
               MODE: [ {{ activeTool.replace('_', ' ') }} ]
             </span>
@@ -1808,61 +2126,111 @@ const activeToolPrompt = computed(() => {
             <span class="text-slate-300 text-[11px]">{{ activeToolPrompt }}</span>
           </div>
 
-          <!-- Panel Orientation & Quick Controls (Requirement 4 & 9) -->
-          <div v-if="activeTool === 'add_panel'" class="flex items-center gap-2">
-            <span class="text-[10px] text-slate-400 font-bold font-mono">ORIENTATION:</span>
-            <div class="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded border border-slate-700">
+          <div class="flex flex-wrap items-center gap-2">
+            <!-- Solar Panel Brand & Model Selection (Requirements 1-3) & Orientation (Req 7) -->
+            <div v-if="activeTool === 'add_panel'" class="flex flex-wrap items-center gap-2">
+              <div class="flex items-center gap-1">
+                <span class="text-[10px] text-slate-400 font-bold font-mono">BRAND:</span>
+                <select
+                  v-model="selectedPanelBrand"
+                  @change="onBrandChanged"
+                  class="bg-slate-800 text-white text-[11px] px-2 py-0.5 rounded border border-slate-700 focus:outline-none"
+                >
+                  <option value="" disabled>Select Brand</option>
+                  <option v-for="brand in solarPanelBrands" :key="brand.id || brand.name" :value="brand.name">
+                    {{ brand.name }}
+                  </option>
+                </select>
+              </div>
+
+              <div class="flex items-center gap-1">
+                <span class="text-[10px] text-slate-400 font-bold font-mono">MODEL:</span>
+                <select
+                  v-model="selectedPanelModelName"
+                  @change="onModelChanged"
+                  class="bg-slate-800 text-cyan-300 text-[11px] px-2 py-0.5 rounded border border-slate-700 focus:outline-none max-w-[180px] truncate"
+                >
+                  <option value="" disabled>Select Model</option>
+                  <option v-for="model in availableModelsForBrand" :key="model.modelName" :value="model.modelName">
+                    {{ model.modelName }}
+                  </option>
+                </select>
+              </div>
+
+              <div class="h-3 w-px bg-slate-700 mx-0.5"></div>
+
+              <span class="text-[10px] text-slate-400 font-bold font-mono">ORIENTATION:</span>
+              <div class="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded border border-slate-700">
+                <button
+                  type="button"
+                  @click="panelOrientation = 'portrait'"
+                  :class="[
+                    'px-2 py-0.5 text-[10px] font-bold rounded transition-colors',
+                    panelOrientation === 'portrait' ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-white'
+                  ]"
+                >
+                  PORTRAIT
+                </button>
+                <button
+                  type="button"
+                  @click="panelOrientation = 'landscape'"
+                  :class="[
+                    'px-2 py-0.5 text-[10px] font-bold rounded transition-colors',
+                    panelOrientation === 'landscape' ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-white'
+                  ]"
+                >
+                  LANDSCAPE
+                </button>
+              </div>
               <button
                 type="button"
-                @click="panelOrientation = 'portrait'"
-                :class="[
-                  'px-2 py-0.5 text-[10px] font-bold rounded transition-colors',
-                  panelOrientation === 'portrait' ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-white'
-                ]"
+                @click="handleRotateSelected90"
+                class="px-2 py-0.5 text-[10px] font-bold rounded bg-slate-800 text-slate-300 hover:text-white border border-slate-700 flex items-center gap-1"
+                title="Rotate 90° (E)"
               >
-                PORTRAIT
-              </button>
-              <button
-                type="button"
-                @click="panelOrientation = 'landscape'"
-                :class="[
-                  'px-2 py-0.5 text-[10px] font-bold rounded transition-colors',
-                  panelOrientation === 'landscape' ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-white'
-                ]"
-              >
-                LANDSCAPE
+                <span>⟳</span>
+                <span>ROTATE 90°</span>
               </button>
             </div>
-            <button
-              type="button"
-              @click="handleRotateSelected90"
-              class="px-2 py-0.5 text-[10px] font-bold rounded bg-slate-800 text-slate-300 hover:text-white border border-slate-700 flex items-center gap-1"
-              title="Rotate 90° (E)"
-            >
-              <span>⟳</span>
-              <span>ROTATE 90°</span>
-            </button>
-          </div>
 
-          <div v-else-if="activeTool === 'add_obstruction'" class="flex items-center gap-1.5">
-            <span class="text-[10px] text-slate-400 font-bold">TYPE:</span>
-            <select
-              v-model="pendingObstacleType"
-              class="bg-slate-800 text-white text-[11px] px-2 py-0.5 rounded border border-slate-700 focus:outline-none"
+            <div v-else-if="activeTool === 'add_obstruction'" class="flex items-center gap-1.5">
+              <span class="text-[10px] text-slate-400 font-bold">TYPE:</span>
+              <select
+                v-model="pendingObstacleType"
+                class="bg-slate-800 text-white text-[11px] px-2 py-0.5 rounded border border-slate-700 focus:outline-none"
+              >
+                <option value="Chimney">Chimney</option>
+                <option value="Water Tank">Water Tank</option>
+                <option value="Antenna">Antenna</option>
+                <option value="HVAC">HVAC Equipment</option>
+                <option value="Building">Nearby Structure</option>
+                <option value="Other">Custom Obstruction</option>
+              </select>
+            </div>
+
+            <button
+              v-if="isViewerFullscreen"
+              type="button"
+              @click="toggleFullscreenInspector"
+              :class="[
+                'px-2 py-0.5 text-[10px] font-bold rounded border transition-colors cursor-pointer',
+                showInspectorInFullscreen
+                  ? 'bg-cyan-600 text-white border-cyan-500'
+                  : selectedObjectId
+                    ? 'bg-slate-900 text-cyan-300 border-cyan-500/60 hover:bg-slate-800'
+                    : 'bg-slate-950 text-slate-300 hover:text-white border-slate-700'
+              ]"
+              title="Toggle Object Inspector Panel"
             >
-              <option value="Chimney">Chimney</option>
-              <option value="Water Tank">Water Tank</option>
-              <option value="Antenna">Antenna</option>
-              <option value="HVAC">HVAC Equipment</option>
-              <option value="Building">Nearby Structure</option>
-              <option value="Other">Custom Obstruction</option>
-            </select>
+              ⚙ INSPECTOR{{ selectedObjectId ? ` (${selectedObjectId})` : '' }}
+            </button>
           </div>
         </div>
 
         <!-- 3D Canvas -->
-        <div class="flex-1 relative w-full h-full">
+        <div class="flex-1 relative w-full h-full min-h-0 min-w-0">
           <BabylonRoofViewer
+            v-if="hasVerifiedRoof"
             ref="viewerRef"
             :roof-model="currentRoofModel"
             :active-tool="activeTool"
@@ -1882,11 +2250,15 @@ const activeToolPrompt = computed(() => {
             :panel-orientation="panelOrientation"
             :panel-width-m="panelWidthM"
             :panel-length-m="panelLengthM"
+            :panel-thickness-m="panelThicknessM"
+            :panel-manufacturer="selectedPanelBrand"
+            :panel-model-name="selectedPanelModelName"
             :panel-spacing-m="panelSpacingM"
             :panel-setback-m="panelSetbackM"
             :snap-enabled="snapEnabled"
             :grid-snap-enabled="gridSnapEnabled"
             :shadow-exclusion-enabled="autoArrangeExcludesShadow"
+            :fullscreen-target="rooftopFullscreenRef"
             @select-object="handleSelectObject"
             @clear-selection="handleClearSelection"
             @object-transformed="handleObjectTransformed"
@@ -1899,18 +2271,45 @@ const activeToolPrompt = computed(() => {
             @delete-selected="handleDeleteSelected"
             @extend-row="handleExtendRow"
             @preview-hover="(fb) => hoverPlacementFeedback = fb"
+            @fullscreen-change="handleViewerFullscreenChange"
           />
+
+          <div
+            v-else
+            class="w-full h-full flex items-center justify-center bg-slate-950 p-6"
+          >
+            <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center space-y-4 shadow-2xl">
+              <div class="w-12 h-12 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center mx-auto text-2xl">
+                🏠
+              </div>
+              <p class="text-sm font-semibold text-slate-200">
+                No verified roof yet. Draw and confirm the roof first.
+              </p>
+              <button
+                type="button"
+                @click="navigateTo('/site-assessment')"
+                class="px-4 py-2 text-xs font-bold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white transition-colors"
+              >
+                GO TO SITE ASSESSMENT
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- BOTTOM SUN SIMULATION CONTROL STRIP -->
-        <div class="h-16 bg-slate-900 border-t border-slate-800 px-4 flex items-center justify-between gap-4 shrink-0 z-10 text-xs">
+        <div
+          :class="[
+            isViewerFullscreen ? 'min-h-11 py-1.5' : 'min-h-14 py-2',
+            'bg-slate-900 border-t border-slate-800 px-3 flex flex-wrap items-center justify-between gap-3 shrink-0 z-10 text-xs max-w-full'
+          ]"
+        >
           <!-- Sun Simulation Controls -->
-          <div class="flex items-center gap-3">
+          <div class="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
               @click="toggleSimPlay"
               :class="[
-                'px-3 py-1.5 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shadow-sm',
+                'px-3 py-1.5 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shadow-sm whitespace-nowrap',
                 isSimPlaying ? 'bg-amber-500 text-slate-950 font-black' : 'bg-slate-800 text-white hover:bg-slate-700'
               ]"
             >
@@ -1926,7 +2325,7 @@ const activeToolPrompt = computed(() => {
                 min="480"
                 max="1020"
                 step="10"
-                class="w-44 accent-amber-400 cursor-pointer"
+                class="w-32 sm:w-44 accent-amber-400 cursor-pointer"
                 title="Sun Time Slider"
               />
               <span class="text-[10px] text-slate-400 font-mono">17:00</span>
@@ -1944,8 +2343,8 @@ const activeToolPrompt = computed(() => {
           </div>
 
           <!-- Sun Coordinates & Exclusion Zone Toggle -->
-          <div class="flex items-center gap-4">
-            <div class="font-mono text-[11px] flex items-center gap-3 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="font-mono text-[11px] flex items-center gap-2.5 bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800">
               <span class="text-slate-400">Sun Alt: <strong class="text-white">{{ currentSolarData.pos.solarAltitudeDeg }}°</strong></span>
               <span class="text-slate-600">|</span>
               <span class="text-slate-400">Azimuth: <strong class="text-white">{{ currentSolarData.pos.solarAzimuthDeg }}°</strong></span>
@@ -1953,7 +2352,7 @@ const activeToolPrompt = computed(() => {
               <span class="text-slate-400">Est. Shading: <strong class="text-amber-400">{{ estimatedShadingPercent }}%</strong></span>
             </div>
 
-            <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none">
+            <label class="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none whitespace-nowrap">
               <input
                 v-model="autoArrangeExcludesShadow"
                 type="checkbox"
@@ -1966,14 +2365,31 @@ const activeToolPrompt = computed(() => {
       </main>
 
       <!-- RIGHT SIDEBAR: CONTEXT-SENSITIVE INSPECTOR (AutoCAD/SketchUp Style) -->
-      <aside class="w-80 bg-slate-900 border-l border-slate-800 flex flex-col shrink-0 z-10 text-xs">
-        <div class="p-3 border-b border-slate-800 flex items-center justify-between">
+      <aside
+        v-show="!isViewerFullscreen || showInspectorInFullscreen"
+        :class="[
+          isViewerFullscreen ? 'w-72' : 'w-72 xl:w-80',
+          'bg-slate-900 border-l border-slate-800 flex flex-col shrink-0 z-10 text-xs'
+        ]"
+      >
+        <div class="p-3 border-b border-slate-800 flex items-center justify-between gap-2">
           <span class="font-bold uppercase tracking-wider text-slate-400 text-[10px]">
-            {{ selectedObjectId ? 'OBJECT INSPECTOR' : 'SOLAR DESIGN SUMMARY' }}
+            {{ selectedObjectId ? 'OBJECT INSPECTOR' : (activeTool === 'add_panel' ? 'SOLAR PANEL SELECTION' : 'SOLAR DESIGN SUMMARY') }}
           </span>
-          <span v-if="selectedObjectId" class="font-mono text-[10px] text-cyan-400 font-bold">
-            {{ selectedObjectId }}
-          </span>
+          <div class="flex items-center gap-2">
+            <span v-if="selectedObjectId" class="font-mono text-[10px] text-cyan-400 font-bold">
+              {{ selectedObjectId }}
+            </span>
+            <button
+              v-if="isViewerFullscreen"
+              type="button"
+              @click="toggleFullscreenInspector"
+              title="Collapse Inspector Panel"
+              class="text-slate-400 hover:text-white px-1 py-0.5 rounded hover:bg-slate-800 text-[10px] font-bold cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         <div class="flex-1 overflow-y-auto p-4 space-y-4">
@@ -2301,18 +2717,42 @@ const activeToolPrompt = computed(() => {
             </div>
 
             <!-- SIMPLE MODE CONTENT -->
-            <div v-if="inspectorMode === 'simple'" key="panel-mode-simple" class="space-y-2.5 font-mono text-[11px]">
+            <div v-if="inspectorMode === 'simple'" key="panel-mode-simple" class="space-y-2 font-mono text-[11px]">
               <div class="flex justify-between py-1 border-b border-slate-800/60">
                 <span class="text-slate-400 font-sans">Panel ID:</span>
                 <span class="font-bold text-white">{{ selectedObjectId }}</span>
               </div>
               <div class="flex justify-between py-1 border-b border-slate-800/60">
-                <span class="text-slate-400 font-sans">Power:</span>
-                <span class="font-bold text-emerald-400">{{ selectedObjectData.wattageW }} W</span>
+                <span class="text-slate-400 font-sans">Manufacturer:</span>
+                <span class="font-bold text-white">{{ selectedObjectData.manufacturer || 'Not configured' }}</span>
+              </div>
+              <div class="flex justify-between py-1 border-b border-slate-800/60">
+                <span class="text-slate-400 font-sans">Model:</span>
+                <span class="font-bold text-cyan-300 text-right truncate max-w-[160px]" :title="selectedObjectData.modelName">
+                  {{ selectedObjectData.modelName || 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-1 border-b border-slate-800/60">
+                <span class="text-slate-400 font-sans">Rated Power:</span>
+                <span class="font-bold text-emerald-400">{{ selectedObjectData.wattageW ? `${selectedObjectData.wattageW} W` : 'Not configured' }}</span>
               </div>
               <div class="flex justify-between py-1 border-b border-slate-800/60">
                 <span class="text-slate-400 font-sans">Dimensions:</span>
-                <span class="text-white">{{ selectedObjectData.widthM }} × {{ selectedObjectData.lengthM }} m</span>
+                <span class="text-white">
+                  {{ selectedObjectData.widthM && selectedObjectData.lengthM ? `${selectedObjectData.widthM} × ${selectedObjectData.lengthM} m` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-1 border-b border-slate-800/60">
+                <span class="text-slate-400 font-sans">Thickness:</span>
+                <span class="text-white">
+                  {{ selectedObjectData.thicknessM ? `${Math.round(selectedObjectData.thicknessM * 1000)} mm` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-1 border-b border-slate-800/60">
+                <span class="text-slate-400 font-sans">Efficiency:</span>
+                <span class="font-bold text-cyan-400">
+                  {{ selectedObjectData.efficiencyPercent ? `${selectedObjectData.efficiencyPercent}%` : 'Not configured' }}
+                </span>
               </div>
 
               <!-- Orientation Quick Toggle -->
@@ -2396,6 +2836,28 @@ const activeToolPrompt = computed(() => {
 
             <!-- ADVANCED MODE CONTENT (CAD Coordinates & Engineering Details) -->
             <div v-else key="panel-mode-advanced" class="space-y-2 font-mono text-[11px]">
+              <div class="space-y-1 pb-1 border-b border-slate-800/80 text-[10px]">
+                <div class="flex justify-between">
+                  <span class="text-slate-400 font-sans">Brand / Model:</span>
+                  <span class="font-bold text-cyan-300 text-right truncate max-w-[170px]" :title="selectedObjectData.modelName">
+                    {{ selectedObjectData.manufacturer || 'Solar' }} - {{ selectedObjectData.modelName || 'Not configured' }}
+                  </span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400 font-sans">Power & Efficiency:</span>
+                  <span class="text-white">
+                    {{ selectedObjectData.wattageW ? `${selectedObjectData.wattageW} W` : 'Not configured' }}
+                    <span v-if="selectedObjectData.efficiencyPercent" class="text-cyan-400">({{ selectedObjectData.efficiencyPercent }}%)</span>
+                  </span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400 font-sans">Thickness:</span>
+                  <span class="text-slate-300">
+                    {{ selectedObjectData.thicknessM ? `${Math.round(selectedObjectData.thicknessM * 1000)} mm (${selectedObjectData.thicknessM}m)` : 'Not configured' }}
+                  </span>
+                </div>
+              </div>
+
               <div class="pt-1 border-t border-slate-800 space-y-1">
                 <span class="text-[10px] text-slate-400 font-sans">Coordinates (Local Meters):</span>
                 <div class="grid grid-cols-3 gap-1.5">
@@ -2502,30 +2964,32 @@ const activeToolPrompt = computed(() => {
           </div>
 
           <!-- D. ROOF FOOTPRINT INSPECTOR -->
-          <div v-else-if="selectedObjectType === 'roof'" key="inspector-roof" class="space-y-3">
+          <div v-else-if="selectedObjectType === 'roof' && hasVerifiedRoof" key="inspector-roof" class="space-y-3">
             <div class="flex items-center justify-between pb-2 border-b border-slate-800">
               <div class="flex items-center gap-1.5 font-bold text-blue-400">
                 <span>🏠</span>
                 <span>Roof Geometry</span>
               </div>
               <span class="text-[9px] px-1.5 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800">
-                MAP BOUNDARY
+                VERIFIED BOUNDARY
               </span>
             </div>
 
-            <div class="space-y-2 text-[11px]">
+            <div class="space-y-2.5 text-[11px]">
               <div>
                 <label class="block text-[10px] text-slate-400 mb-1">Roof Structure Type:</label>
                 <select
-                  v-model="roofStructureType"
-                  @change="recalculateRoofBoundaryGeometry"
-                  class="w-full bg-slate-950 text-white px-2 py-1 rounded border border-slate-700"
+                  v-model="editorRoofStructureType"
+                  @change="onRoofStructureChanged"
+                  class="w-full bg-slate-950 text-white px-2 py-1.5 rounded border border-slate-700"
                 >
-                  <option value="Flat">Flat Roof</option>
-                  <option value="Single Slope">Single Slope / Shed</option>
-                  <option value="Gable">Gable Roof</option>
-                  <option value="Hip">Hip Roof</option>
-                  <option value="Custom">Custom Architectural</option>
+                  <option
+                    v-for="opt in roofStructureOptions"
+                    :key="opt.value"
+                    :value="opt.value"
+                  >
+                    {{ opt.label }}
+                  </option>
                 </select>
               </div>
 
@@ -2533,32 +2997,44 @@ const activeToolPrompt = computed(() => {
                 <div>
                   <label class="block text-[10px] text-slate-400 font-sans mb-1">Pitch (°):</label>
                   <input
-                    v-model.number="roofPitchDegrees"
+                    v-model.number="editorPitchDegrees"
                     type="number"
                     step="1"
                     min="0"
                     max="60"
-                    @change="recalculateRoofBoundaryGeometry"
-                    class="w-full bg-slate-950 text-white px-2 py-1 rounded border border-slate-700"
+                    :disabled="editorRoofStructureType === 'Flat'"
+                    @change="onRoofSlopeChanged"
+                    class="w-full bg-slate-950 text-white px-2 py-1 rounded border border-slate-700 disabled:opacity-50"
                   />
-                  <span class="text-[9px] text-slate-500 font-sans">Installer Input</span>
+                  <span class="text-[9px] text-slate-500 font-sans">Installer-Provided</span>
                 </div>
                 <div>
                   <label class="block text-[10px] text-slate-400 font-sans mb-1">Azimuth (°):</label>
                   <input
-                    v-model.number="roofAzimuthDegrees"
+                    v-model.number="editorAzimuthDegrees"
                     type="number"
                     step="5"
                     min="0"
                     max="360"
-                    @change="recalculateRoofBoundaryGeometry"
+                    @change="onRoofSlopeChanged"
                     class="w-full bg-slate-950 text-white px-2 py-1 rounded border border-slate-700"
                   />
-                  <span class="text-[9px] text-slate-500 font-sans">Installer Input</span>
+                  <span class="text-[9px] text-slate-500 font-sans">Installer-Provided</span>
                 </div>
               </div>
 
-              <div class="pt-2">
+              <div class="bg-slate-950 p-2.5 rounded-lg border border-slate-800 space-y-1 font-mono text-[10px]">
+                <div class="flex justify-between text-slate-400">
+                  <span class="font-sans">Verified Footprint:</span>
+                  <span class="font-bold text-white">{{ currentGrossAreaM2 }} m²</span>
+                </div>
+                <div class="flex justify-between text-slate-400">
+                  <span class="font-sans">Roof Thickness:</span>
+                  <span class="text-slate-200">{{ editorRoofThicknessM }} m (Sloped Slab)</span>
+                </div>
+              </div>
+
+              <div class="pt-1">
                 <button
                   type="button"
                   @click="activeTool = 'edit_roof'"
@@ -2570,8 +3046,214 @@ const activeToolPrompt = computed(() => {
             </div>
           </div>
 
-          <!-- E. SCENE SUMMARY & VALIDATION (Default when no object is selected) -->
+          <!-- E. SOLAR PANEL SELECTION PANEL (Requirements 1 - 4) -->
+          <div v-else-if="activeTool === 'add_panel' && !selectedObjectId" key="inspector-panel-selection" class="space-y-4">
+            <div class="flex items-center justify-between pb-2 border-b border-slate-800">
+              <div class="flex items-center gap-1.5 font-bold text-cyan-400">
+                <span>⚡</span>
+                <span>Solar Panel Selection</span>
+              </div>
+              <span class="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-cyan-950 text-cyan-300 border-cyan-800">
+                TIER-1 PV
+              </span>
+            </div>
+
+            <!-- Brand Selector (Requirement 2) -->
+            <div class="space-y-1">
+              <label class="block text-[11px] font-bold text-slate-300 font-sans">
+                Solar Panel Brand
+              </label>
+              <select
+                v-model="selectedPanelBrand"
+                @change="onBrandChanged"
+                class="w-full bg-slate-950 text-white px-2.5 py-2 rounded-lg border border-slate-700 text-xs font-semibold focus:outline-none focus:border-cyan-500"
+              >
+                <option value="" disabled>Select Brand</option>
+                <option v-for="brand in solarPanelBrands" :key="brand.id || brand.name" :value="brand.name">
+                  {{ brand.name }}
+                </option>
+              </select>
+            </div>
+
+            <!-- Model Selector (Requirement 3) -->
+            <div class="space-y-1">
+              <label class="block text-[11px] font-bold text-slate-300 font-sans">
+                Panel Model
+              </label>
+              <select
+                v-model="selectedPanelModelName"
+                @change="onModelChanged"
+                :disabled="!selectedPanelBrand || availableModelsForBrand.length === 0"
+                class="w-full bg-slate-950 text-white px-2.5 py-2 rounded-lg border border-slate-700 text-xs font-semibold focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+              >
+                <option value="" disabled>Select Model</option>
+                <option v-for="model in availableModelsForBrand" :key="model.modelName" :value="model.modelName">
+                  {{ model.modelName }}
+                </option>
+              </select>
+            </div>
+
+            <!-- Panel Information Card (Requirement 4) -->
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-2 text-[11px]">
+              <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 pb-1 border-b border-slate-800">
+                Panel Information
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900">
+                <span class="text-slate-400 font-sans">Manufacturer:</span>
+                <span class="font-bold text-white">{{ currentSelectedModelSpec ? currentSelectedModelSpec.manufacturer : (selectedPanelBrand || 'Not configured') }}</span>
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900">
+                <span class="text-slate-400 font-sans">Model:</span>
+                <span class="font-bold text-cyan-300 text-right truncate max-w-[170px]" :title="currentSelectedModelSpec ? currentSelectedModelSpec.modelName : selectedPanelModelName">
+                  {{ currentSelectedModelSpec ? currentSelectedModelSpec.modelName : (selectedPanelModelName || 'Not configured') }}
+                </span>
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900 font-mono">
+                <span class="text-slate-400 font-sans">Rated Power:</span>
+                <span class="font-bold text-emerald-400">
+                  {{ currentSelectedModelSpec?.ratedPowerW ? `${currentSelectedModelSpec.ratedPowerW} W` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900 font-mono">
+                <span class="text-slate-400 font-sans">Width:</span>
+                <span class="text-white">
+                  {{ currentSelectedModelSpec?.widthM ? `${currentSelectedModelSpec.widthM.toFixed(3)} m` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900 font-mono">
+                <span class="text-slate-400 font-sans">Height:</span>
+                <span class="text-white">
+                  {{ currentSelectedModelSpec?.heightM ? `${currentSelectedModelSpec.heightM.toFixed(3)} m` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-0.5 border-b border-slate-900 font-mono">
+                <span class="text-slate-400 font-sans">Thickness:</span>
+                <span class="text-white">
+                  {{ currentSelectedModelSpec?.thicknessM ? `${Math.round(currentSelectedModelSpec.thicknessM * 1000)} mm` : 'Not configured' }}
+                </span>
+              </div>
+              <div class="flex justify-between py-0.5 font-mono">
+                <span class="text-slate-400 font-sans">Efficiency:</span>
+                <span class="font-bold text-cyan-400">
+                  {{ currentSelectedModelSpec?.efficiencyPercent ? `${currentSelectedModelSpec.efficiencyPercent}%` : 'Not configured' }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Orientation & Placement Instructions (Requirement 7) -->
+            <div class="space-y-2 pt-1">
+              <label class="block text-[10px] text-slate-400 font-sans">Placement Orientation:</label>
+              <div class="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                <button
+                  type="button"
+                  @click="panelOrientation = 'portrait'"
+                  :class="[
+                    'py-1.5 rounded-md text-xs font-bold transition-colors',
+                    panelOrientation === 'portrait' ? 'bg-cyan-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                  ]"
+                >
+                  PORTRAIT
+                </button>
+                <button
+                  type="button"
+                  @click="panelOrientation = 'landscape'"
+                  :class="[
+                    'py-1.5 rounded-md text-xs font-bold transition-colors',
+                    panelOrientation === 'landscape' ? 'bg-cyan-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
+                  ]"
+                >
+                  LANDSCAPE
+                </button>
+              </div>
+            </div>
+
+            <div class="p-3 bg-cyan-950/40 border border-cyan-800/60 rounded-xl text-[11px] text-cyan-200 space-y-1">
+              <div class="font-bold flex items-center gap-1.5 text-cyan-300">
+                <span>💡</span>
+                <span>Click to Place</span>
+              </div>
+              <p class="text-[10px] text-slate-300 leading-relaxed">
+                Move your cursor over the 3D roof surface to preview. Left-click to place the selected <strong class="text-white">{{ currentSelectedModelSpec?.modelName || 'panel' }}</strong> directly onto the sloped plane.
+              </p>
+            </div>
+          </div>
+
+          <!-- F. SCENE SUMMARY & VALIDATION (Default when no object is selected) -->
           <div v-else key="inspector-summary" class="space-y-4">
+            <div
+              v-if="!hasVerifiedRoof"
+              class="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2.5 text-xs"
+            >
+              <p class="text-slate-300 font-medium">
+                No verified roof yet. Draw and confirm the roof first.
+              </p>
+              <button
+                type="button"
+                @click="navigateTo('/site-assessment')"
+                class="w-full py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded-lg text-[11px]"
+              >
+                OPEN SITE ASSESSMENT
+              </button>
+            </div>
+
+            <!-- Live Roof Structure & Slope Controls -->
+            <div
+              v-else
+              class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-2.5 text-[11px]"
+            >
+              <div class="flex items-center justify-between">
+                <span class="text-[10px] font-bold uppercase tracking-wider text-blue-400">Roof Structure</span>
+                <span class="text-[9px] font-mono text-slate-400">{{ editorRoofThicknessM }}m Sloped Slab</span>
+              </div>
+
+              <div>
+                <label class="block text-[10px] text-slate-400 mb-1">Roof Structure Type:</label>
+                <select
+                  v-model="editorRoofStructureType"
+                  @change="onRoofStructureChanged"
+                  class="w-full bg-slate-900 text-white px-2 py-1.5 rounded border border-slate-700"
+                >
+                  <option
+                    v-for="opt in roofStructureOptions"
+                    :key="opt.value"
+                    :value="opt.value"
+                  >
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 font-mono">
+                <div>
+                  <label class="block text-[10px] text-slate-400 font-sans mb-1">Pitch (°):</label>
+                  <input
+                    v-model.number="editorPitchDegrees"
+                    type="number"
+                    step="1"
+                    min="0"
+                    max="60"
+                    :disabled="editorRoofStructureType === 'Flat'"
+                    @change="onRoofSlopeChanged"
+                    class="w-full bg-slate-900 text-white px-2 py-1 rounded border border-slate-700 disabled:opacity-50"
+                  />
+                  <span class="text-[9px] text-slate-500 font-sans">Installer-Provided</span>
+                </div>
+                <div>
+                  <label class="block text-[10px] text-slate-400 font-sans mb-1">Azimuth (°):</label>
+                  <input
+                    v-model.number="editorAzimuthDegrees"
+                    type="number"
+                    step="5"
+                    min="0"
+                    max="360"
+                    @change="onRoofSlopeChanged"
+                    class="w-full bg-slate-900 text-white px-2 py-1 rounded border border-slate-700"
+                  />
+                  <span class="text-[9px] text-slate-500 font-sans">Installer-Provided</span>
+                </div>
+              </div>
+            </div>
+
             <!-- Telemetry Metrics Summary Table -->
             <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-2 text-[11px] font-mono">
               <div class="flex justify-between text-slate-400">
@@ -2594,12 +3276,15 @@ const activeToolPrompt = computed(() => {
                 <span class="font-sans">Solar Panels:</span>
                 <span class="font-bold text-white">{{ currentPanelsCount }}</span>
               </div>
-              <div class="flex justify-between text-slate-400">
-                <span class="font-sans">Panel Rating:</span>
-                <span class="text-white">{{ panelWattageW }} W</span>
+              <div v-if="Object.keys(panelsByManufacturer).length > 0" class="pt-1 border-t border-slate-900 space-y-0.5">
+                <div class="text-[10px] text-slate-500 font-sans uppercase font-bold">Brand Breakdown:</div>
+                <div v-for="(count, brand) in panelsByManufacturer" :key="brand" class="flex justify-between text-slate-300 pl-1 text-[10px]">
+                  <span class="truncate pr-1">{{ brand }}:</span>
+                  <span class="font-bold text-cyan-300">{{ count }}</span>
+                </div>
               </div>
               <div class="flex justify-between text-slate-400 pt-1 border-t border-slate-800">
-                <span class="font-sans font-bold text-slate-300">System Capacity:</span>
+                <span class="font-sans font-bold text-slate-300">Total DC Capacity:</span>
                 <span class="font-bold text-emerald-400">{{ currentSystemKwp }} kWp</span>
               </div>
               <div class="flex justify-between text-slate-400">

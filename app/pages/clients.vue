@@ -154,7 +154,6 @@ function formatDate(isoStr: string) {
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200">
       <div>
         <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Client Management</h1>
-        <p class="text-sm text-slate-500 mt-1">Directory of commercial, residential, and industrial customer accounts.</p>
       </div>
 
       <button

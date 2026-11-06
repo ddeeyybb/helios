@@ -26,10 +26,9 @@ export default defineEventHandler(async (event) => {
 
   const {
     projectId,
-    action, // 'polygon' | 'manual' | 'save_verified'
+    action, // 'polygon' | 'save_verified'
     polygonConfig,
     verifiedModel,
-    manualConfig,
     obstacles
   } = body
 
@@ -63,24 +62,25 @@ export default defineEventHandler(async (event) => {
     }
   }
 
-  // Action 2: Generate 3D RoofModel from manually drawn polygon coordinates
+  // Action 2: Generate 3D RoofModel strictly from verified polygon coordinates
   if (action === 'polygon' && polygonConfig) {
     const {
-      centerLat = 6.7497,
-      centerLng = 125.3572,
+      centerLat = 0,
+      centerLng = 0,
       coordinates = [],
-      roofAreaM2 = 100,
-      usableAreaM2 = 80,
+      roofAreaM2 = 0,
+      usableAreaM2 = 0,
       pitchDegrees = 15,
       azimuthDegrees = 180,
       eaveHeightM = 3.5,
-      roofType = 'Custom Drawn'
+      roofThicknessM = 0.15,
+      roofType = 'Hip / Pyramid'
     } = polygonConfig
 
     if (!coordinates || coordinates.length < 3) {
       return {
         success: false,
-        message: 'At least 3 boundary coordinates are required to calculate roof geometry.',
+        message: 'No verified roof yet. Draw and confirm the roof first.',
         data: null
       }
     }
@@ -96,7 +96,8 @@ export default defineEventHandler(async (event) => {
         pitchDegrees,
         azimuthDegrees,
         eaveHeightM,
-        roofType
+        roofType,
+        roofThicknessM
       )
 
       if (obstacles && obstacles.length > 0) {
@@ -107,58 +108,20 @@ export default defineEventHandler(async (event) => {
 
       return {
         success: true,
-        message: '3D RoofModel generated from manual roof boundary.',
+        message: '3D RoofModel generated from verified roof boundary.',
         data: model
       }
     } catch (err: any) {
       return {
         success: false,
-        message: err?.message || 'Failed to generate roof geometry from polygon.',
+        message: err?.message || 'Failed to generate roof geometry from verified polygon.',
         data: null
       }
     }
   }
 
-  // Action 3: Generate manual roof model from geometric presets
-  if (action === 'manual' || manualConfig) {
-    const {
-      centerLat = 6.7497,
-      centerLng = 125.3572,
-      roofType = 'Gable',
-      lengthM = 14,
-      widthM = 10,
-      pitchDegrees = 22,
-      azimuthDegrees = 180,
-      eaveHeightM = 3.5
-    } = manualConfig || {}
-
-    const model = RoofGeometryService.generateManualRoofModel(
-      pid,
-      centerLat,
-      centerLng,
-      roofType,
-      lengthM,
-      widthM,
-      pitchDegrees,
-      azimuthDegrees,
-      eaveHeightM
-    )
-
-    if (obstacles && obstacles.length > 0) {
-      model.obstacles = obstacles
-    }
-
-    setStoredRoofModel(pid, model)
-
-    return {
-      success: true,
-      message: 'Manual 3D RoofModel generated successfully.',
-      data: model
-    }
-  }
-
   return {
     success: false,
-    message: 'Unknown action specified.'
+    message: 'No verified roof yet. Draw and confirm the roof first.'
   }
 })

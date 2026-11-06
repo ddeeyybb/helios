@@ -60,13 +60,7 @@ function formatDate(isoStr?: string) {
       <div>
         <div class="flex items-center gap-2">
           <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Project Engineering Report</h1>
-          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
-            Official Submittal Pack
-          </span>
         </div>
-        <p class="text-sm text-slate-500 mt-1">
-          Complete engineering feasibility review, rooftop geometric data, solar yield modeling, and electrical sizing.
-        </p>
       </div>
 
       <div class="flex items-center gap-2">
@@ -414,15 +408,12 @@ function formatDate(isoStr?: string) {
           <polyline points="10 9 9 9 8 9" />
         </svg>
       </div>
-      <h3 class="text-base font-bold text-slate-900">No project selected</h3>
-      <p class="text-xs text-slate-500 mt-1 mb-5">
-        Select an existing project or create one to generate the comprehensive engineering report submittal pack.
-      </p>
+      <h3 class="text-base font-bold text-slate-900 mb-4">No project selected</h3>
       <NuxtLink
         to="/projects"
         class="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-700 shadow-sm shadow-blue-500/20"
       >
-        Open Projects Pipeline
+        Projects
       </NuxtLink>
     </div>
   </div>

@@ -13,6 +13,16 @@ export type RoofDataSource =
   | 'Calculated'
   | 'Unavailable'
 
+export type CanonicalRoofStructureType =
+  | 'Hip / Pyramid'
+  | 'Gable'
+  | 'Single Slope / Shed'
+  | 'L-Shape'
+  | 'T-Shape'
+  | 'U-Shape'
+  | 'Irregular'
+  | 'Flat'
+
 export interface RoofVertex {
   x: number // East/West distance in meters relative to building center
   y: number // Elevation in meters (local ground / base = 0)
@@ -106,6 +116,18 @@ export interface RoofSegment {
   potentialPanels?: number
   yearlyEnergyDcKwh?: number
   geometry?: RoofPlaneGeometry
+
+  // Canonical v2 verified footprint & multi-plane 3D metadata
+  footprint2D?: Array<{ x: number; z: number }>
+  boundaryLatLng?: Array<{ lat: number; lng: number }>
+  perimeter3D?: RoofVertex[]
+  ridgeLines?: Array<[RoofVertex, RoofVertex]>
+  topSurfaceVertices?: RoofVertex[]
+  topSurfaceIndices?: number[]
+  roofType?: CanonicalRoofStructureType | string
+  roofThicknessM?: number
+  eaveHeightM?: number
+  geometryVersion?: number
 }
 
 export type ObstacleType =
@@ -196,6 +218,7 @@ export interface PlacedSolarPanel {
   azimuthDeg?: number
   manufacturer?: string
   modelName?: string
+  efficiencyPercent?: number
   status?: 'VALID' | 'INVALID'
   validationReason?: string
   locked?: boolean
@@ -286,6 +309,21 @@ export interface RoofModel {
   pitchDegrees?: number
   azimuth?: number
   azimuthDegrees?: number
+  roofThicknessM?: number
+  eaveHeightM?: number
+  boundaryLatLng?: Array<{ lat: number; lng: number }>
+  footprint2D?: Array<{ x: number; z: number }>
+  mapAreaM2?: number
+  footprintAreaM2?: number
+  areaDiscrepancy?: {
+    googleAreaM2: number
+    babylonAreaM2: number
+    differencePercent: number
+    isDiscrepancyAcceptable: boolean
+    warningMessage?: string
+  }
+  structureVerifiedByInstaller?: boolean
+  geometryVersion?: number
   dimensions?: {
     lengthM?: number
     widthM?: number
@@ -295,41 +333,16 @@ export interface RoofModel {
 }
 
 // ==========================================
-// AI-ASSISTED ROOF DETECTION & VERIFICATION
+// MANUAL ROOF DRAWING & VERIFICATION
 // ==========================================
 
-export type DetectionSource = 'ai-assisted' | 'manual'
-export type ConfidenceCategory = 'HIGH' | 'MEDIUM' | 'LOW'
-
-export interface RoofDetectionPoint {
-  lat: number
-  lng: number
-  source?: 'ai-suggested' | 'installer-added'
-}
-
-export interface RoofDetectionResult {
-  success: boolean
-  confidence?: number // 0.0 - 1.0 (e.g. 0.91)
-  confidenceCategory?: ConfidenceCategory
-  points?: RoofDetectionPoint[]
-  areaM2?: number
-  source: DetectionSource
-  detectedAt?: string
-  message?: string
-  buildingBoundingBox?: {
-    sw: { lat: number; lng: number }
-    ne: { lat: number; lng: number }
-  }
-}
+export type DetectionSource = 'manual'
 
 export interface VerifiedRoofPolygon {
   source: DetectionSource
-  confidence?: number
-  confidenceCategory?: ConfidenceCategory
   verified: boolean
   verifiedBy?: string
   verifiedAt?: string
-  detectedAt?: string
   installerEditsCount: number
   points: Array<{ lat: number; lng: number }>
   areaM2: number
@@ -337,15 +350,13 @@ export interface VerifiedRoofPolygon {
 
 export type RoofAssessmentState =
   | 'IDLE'
-  | 'DETECTING'
-  | 'DETECTED'
   | 'EDITING'
   | 'CONFIRMED'
-  | 'FAILED'
 
 export type RoofDrawingMode =
   | 'none'
   | 'manual-draw'
   | 'edit-points'
   | 'add-point'
+
 

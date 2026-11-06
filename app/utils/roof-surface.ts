@@ -1,6 +1,7 @@
 import { Vector3, Quaternion, Ray, type Scene, type AbstractMesh } from '@babylonjs/core'
-import type { RoofModel, RoofSegment, PlacedSolarPanel } from '~/types/roof'
-import { pointInPolygon } from '~/utils/panel-placement'
+import type { RoofModel, RoofSegment, RoofVertex, PlacedSolarPanel } from '../../types/roof'
+import { pointInPolygon } from './panel-placement'
+import { extractVerifiedFootprint2D } from './roof-mesh-generator'
 
 export interface RoofSurfaceResult {
   x: number
@@ -20,13 +21,74 @@ export interface RoofSurfaceResult {
  */
 export const DEFAULT_MOUNTING_CLEARANCE_M = 0.04
 
+function derivePitchAndAzimuthFromNormal(
+  normal: Vector3,
+  fallbackAzimuthDeg = 180
+): { pitchDeg: number; azimuthDeg: number } {
+  const clampedY = Math.max(-1, Math.min(1, normal.y))
+  const pitchDeg = Number(((Math.acos(clampedY) * 180) / Math.PI).toFixed(2))
+  const horiz = Math.hypot(normal.x, normal.z)
+  const azimuthDeg =
+    horiz > 1e-4
+      ? Number((((Math.atan2(normal.x, normal.z) * 180) / Math.PI + 360) % 360).toFixed(1))
+      : fallbackAzimuthDeg
+  return { pitchDeg, azimuthDeg }
+}
+
+function interpolateTopTriangles(
+  x: number,
+  z: number,
+  verts: RoofVertex[],
+  tris: number[]
+): { y: number; normal: Vector3 } | null {
+  let bestHit: { y: number; normal: Vector3 } | null = null
+
+  for (let i = 0; i < tris.length; i += 3) {
+    const i1 = tris[i]
+    const i2 = tris[i + 1]
+    const i3 = tris[i + 2]
+    if (i1 === undefined || i2 === undefined || i3 === undefined) continue
+
+    const v1 = verts[i1]
+    const v2 = verts[i2]
+    const v3 = verts[i3]
+    if (!v1 || !v2 || !v3) continue
+
+    // Barycentric coordinates in 2D (x, z) — skips vertical fascia triangles automatically (det == 0)
+    const det = (v2.z - v3.z) * (v1.x - v3.x) + (v3.x - v2.x) * (v1.z - v3.z)
+    if (Math.abs(det) < 1e-6) continue
+
+    const w1 = ((v2.z - v3.z) * (x - v3.x) + (v3.x - v2.x) * (z - v3.z)) / det
+    const w2 = ((v3.z - v1.z) * (x - v3.x) + (v1.x - v3.x) * (z - v3.z)) / det
+    const w3 = 1 - w1 - w2
+
+    if (w1 >= -0.008 && w2 >= -0.008 && w3 >= -0.008) {
+      const exactY = w1 * v1.y + w2 * v2.y + w3 * v3.y
+
+      // Babylon left-handed upward normal: (v3 - v1) x (v2 - v1)
+      const edge1 = new Vector3(v3.x - v1.x, v3.y - v1.y, v3.z - v1.z)
+      const edge2 = new Vector3(v2.x - v1.x, v2.y - v1.y, v2.z - v1.z)
+      let normal = Vector3.Cross(edge1, edge2)
+      if (normal.lengthSquared() < 1e-10) continue
+      normal.normalize()
+      if (normal.y < 0) normal = normal.scale(-1)
+
+      if (!bestHit || exactY > bestHit.y) {
+        bestHit = { y: exactY, normal }
+      }
+    }
+  }
+
+  return bestHit
+}
+
 /**
  * Calculates the exact 3D roof surface contact point and surface normal
  * at a given local (x, z) horizontal coordinate.
  *
  * Source of truth hierarchy:
- * 1. Babylon 3D Mesh Raycast (exact intersection against actual geometry)
- * 2. Triangulated Face Barycentric Interpolation (exact for irregular/pitched geometry)
+ * 1. Babylon 3D Mesh Raycast (exact intersection against actual multi-plane geometry)
+ * 2. Triangulated Top-Surface Barycentric Interpolation (exact for multi-plane hip/gable/L/T/U roofs)
  * 3. Analytical Pitch/Azimuth Slope Equation (fallback)
  */
 export function getRoofSurfaceAtLocalPoint(
@@ -35,12 +97,12 @@ export function getRoofSurfaceAtLocalPoint(
   roofModel?: RoofModel | null,
   scene?: Scene | null
 ): RoofSurfaceResult {
-  // 1. Raycast against actual Babylon Roof Mesh if scene is active
+  // 1. Raycast downward against actual Babylon Roof Mesh if scene is active
   if (scene) {
     try {
-      const rayOrigin = new Vector3(x, 60, z)
+      const rayOrigin = new Vector3(x, 100, z)
       const rayDir = new Vector3(0, -1, 0)
-      const ray = new Ray(rayOrigin, rayDir, 120)
+      const ray = new Ray(rayOrigin, rayDir, 200)
 
       const hit = scene.pickWithRay(
         ray,
@@ -50,12 +112,14 @@ export function getRoofSurfaceAtLocalPoint(
       if (hit && hit.hit && hit.pickedPoint) {
         const seg = (hit.pickedMesh?.metadata as any)?.segment as RoofSegment | undefined
         const rawNormal = hit.getNormal(true) || new Vector3(0, 1, 0)
-        // Ensure normal points upward
+        // Ensure normal points upward from the top sloped roof plane
         const normal = rawNormal.y < 0 ? rawNormal.scale(-1) : rawNormal
         normal.normalize()
 
-        const pitchDeg = seg?.pitchDegrees ?? 0
-        const azimuthDeg = seg?.azimuthDegrees ?? 180
+        const { pitchDeg, azimuthDeg } = derivePitchAndAzimuthFromNormal(
+          normal,
+          seg?.azimuthDegrees ?? 180
+        )
 
         return {
           x,
@@ -74,61 +138,60 @@ export function getRoofSurfaceAtLocalPoint(
     }
   }
 
-  // 2. Analytical calculation from RoofModel segments
-  const segs = roofModel?.roofSegments || roofModel?.segments || []
+  // 2. Analytical calculation from RoofModel segments (prefers v2 topSurfaceVertices/topSurfaceIndices)
+  const segs = roofModel?.segments?.length ? roofModel.segments : (roofModel?.roofSegments || [])
   if (segs.length > 0) {
     for (const seg of segs) {
-      if (!seg.vertices || seg.vertices.length < 3) continue
+      const footPoly = extractVerifiedFootprint2D(roofModel, seg)
+      if (footPoly.length < 3) continue
 
-      const halfLen = Math.floor(seg.vertices.length / 2)
-      const topVertices = seg.vertices.slice(0, halfLen)
-      const topPoly = topVertices.map(v => ({ x: v.x, z: v.z }))
+      // Check if (x, z) is inside this segment's verified 2D footprint
+      if (pointInPolygon({ x, z }, footPoly)) {
+        // A1. Canonical v2 multi-plane top surface triangles
+        if (
+          seg.topSurfaceVertices &&
+          seg.topSurfaceVertices.length >= 3 &&
+          seg.topSurfaceIndices &&
+          seg.topSurfaceIndices.length >= 3
+        ) {
+          const hit = interpolateTopTriangles(x, z, seg.topSurfaceVertices, seg.topSurfaceIndices)
+          if (hit) {
+            const { pitchDeg, azimuthDeg } = derivePitchAndAzimuthFromNormal(
+              hit.normal,
+              seg.azimuthDegrees ?? 180
+            )
+            return {
+              x,
+              y: Number(hit.y.toFixed(4)),
+              z,
+              normal: hit.normal,
+              pitchDeg,
+              azimuthDeg,
+              segmentIndex: seg.segmentIndex ?? 0,
+              segmentId: seg.id || `seg-${seg.segmentIndex ?? 0}`,
+              isValid: true
+            }
+          }
+        }
 
-      // Check if (x, z) is inside this segment's 2D footprint
-      if (pointInPolygon({ x, z }, topPoly)) {
-        // A. If indices exist, interpolate across triangles using barycentric coordinates
-        if (seg.indices && seg.indices.length >= 3) {
-          for (let i = 0; i < seg.indices.length; i += 3) {
-            const i1 = seg.indices[i]
-            const i2 = seg.indices[i + 1]
-            const i3 = seg.indices[i + 2]
-            if (i1 === undefined || i2 === undefined || i3 === undefined) continue
-            // Only consider top surface triangles (vertex index < halfLen)
-            if (i1 >= halfLen || i2 >= halfLen || i3 >= halfLen) continue
-
-            const v1 = topVertices[i1]
-            const v2 = topVertices[i2]
-            const v3 = topVertices[i3]
-            if (!v1 || !v2 || !v3) continue
-
-            // Barycentric coordinates in 2D (x, z)
-            const det = (v2.z - v3.z) * (v1.x - v3.x) + (v3.x - v2.x) * (v1.z - v3.z)
-            if (Math.abs(det) < 1e-6) continue
-
-            const w1 = ((v2.z - v3.z) * (x - v3.x) + (v3.x - v2.x) * (z - v3.z)) / det
-            const w2 = ((v3.z - v1.z) * (x - v3.x) + (v1.x - v3.x) * (z - v3.z)) / det
-            const w3 = 1 - w1 - w2
-
-            if (w1 >= -0.01 && w2 >= -0.01 && w3 >= -0.01) {
-              const exactY = w1 * v1.y + w2 * v2.y + w3 * v3.y
-
-              // Compute normal of triangle ABC
-              const edge1 = new Vector3(v2.x - v1.x, v2.y - v1.y, v2.z - v1.z)
-              const edge2 = new Vector3(v3.x - v1.x, v3.y - v1.y, v3.z - v1.z)
-              let normal = Vector3.Cross(edge1, edge2).normalize()
-              if (normal.y < 0) normal = normal.scale(-1)
-
-              return {
-                x,
-                y: Number(exactY.toFixed(4)),
-                z,
-                normal,
-                pitchDeg: seg.pitchDegrees ?? 0,
-                azimuthDeg: seg.azimuthDegrees ?? 180,
-                segmentIndex: seg.segmentIndex ?? 0,
-                segmentId: seg.id || `seg-${seg.segmentIndex ?? 0}`,
-                isValid: true
-              }
+        // A2. General segment mesh triangles (pick highest upward-facing surface at (x, z))
+        if (seg.vertices && seg.vertices.length >= 3 && seg.indices && seg.indices.length >= 3) {
+          const hit = interpolateTopTriangles(x, z, seg.vertices, seg.indices)
+          if (hit) {
+            const { pitchDeg, azimuthDeg } = derivePitchAndAzimuthFromNormal(
+              hit.normal,
+              seg.azimuthDegrees ?? 180
+            )
+            return {
+              x,
+              y: Number(hit.y.toFixed(4)),
+              z,
+              normal: hit.normal,
+              pitchDeg,
+              azimuthDeg,
+              segmentIndex: seg.segmentIndex ?? 0,
+              segmentId: seg.id || `seg-${seg.segmentIndex ?? 0}`,
+              isValid: true
             }
           }
         }
@@ -144,12 +207,12 @@ export function getRoofSurfaceAtLocalPoint(
         const baseElevation = seg.center?.y ?? (roofModel?.origin?.elevation ?? 3.5)
 
         const distAlongSlope = -((x - cx) * sinAz + (z - cz) * cosAz)
-        const y = Number((baseElevation + distAlongSlope * Math.sin(pitchRad)).toFixed(4))
+        const y = Number((baseElevation + distAlongSlope * Math.tan(pitchRad)).toFixed(4))
 
         const normal = new Vector3(
-          -Math.sin(pitchRad) * sinAz,
+          Math.sin(pitchRad) * sinAz,
           Math.cos(pitchRad),
-          -Math.sin(pitchRad) * cosAz
+          Math.sin(pitchRad) * cosAz
         ).normalize()
 
         return {
@@ -212,7 +275,7 @@ export function computePanelRotationQuaternion(
 }
 
 /**
- * Ensures a solar panel's Y elevation and normal vector match the actual roof surface.
+ * Ensures a solar panel's Y elevation, tilt, azimuth, and normal vector match the actual sloped roof facet.
  */
 export function snapPanelToRoofSurface(
   panel: PlacedSolarPanel,
@@ -224,5 +287,6 @@ export function snapPanelToRoofSurface(
   panel.y = Number((surface.y + clearanceM).toFixed(4))
   panel.normal = [surface.normal.x, surface.normal.y, surface.normal.z]
   panel.tiltPitchDeg = surface.pitchDeg
+  panel.azimuthDeg = surface.azimuthDeg
   return surface
 }

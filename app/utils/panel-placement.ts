@@ -9,8 +9,8 @@
  * - Computes true physical capacity (kWp) from actually placed panels
  */
 
-import type { PlacedSolarPanel, RoofObstacle, RooftopFeature } from '~/types/roof'
-import { DEFAULT_MOUNTING_CLEARANCE_M } from '~/utils/roof-surface'
+import type { PlacedSolarPanel, RoofObstacle, RooftopFeature } from '../../types/roof'
+import { DEFAULT_MOUNTING_CLEARANCE_M } from './roof-surface'
 
 export interface PanelPlacementConfig {
   panelWidthM: number // e.g. 1.134 m

@@ -2,13 +2,13 @@
 import { ref } from 'vue'
 import { useSiteAssessment } from '~/composables/useSiteAssessment'
 import { useInstallerData } from '~/composables/useInstallerData'
-import ObstructionModal from '~/components/site-assessment/ObstructionModal.vue'
-import type { RoofObstacle } from '~/types/roof'
 
 const {
   selectedProperty,
   hasSelectedProperty,
   roofStructureType,
+  roofStructureOptions,
+  setInstallerRoofStructureType,
   roofBoundaryDrawn,
   roofAreaSqM,
   usableRoofPercent,
@@ -19,11 +19,6 @@ const {
   roofAzimuthDegrees,
   roofThicknessM,
   eaveHeightM,
-  // Obstructions
-  obstructions,
-  addObstruction,
-  updateObstruction,
-  removeObstruction,
   // Solar Panel Placement
   panelWattageW,
   panelWidthM,
@@ -56,35 +51,13 @@ const {
 
 const { activeProject } = useInstallerData()
 
-// UI modal & edit states
-const isObstructionModalOpen = ref(false)
-const editingObstacle = ref<Partial<RoofObstacle> | null>(null)
+// UI edit states
 const isCustomPitch = ref(false)
 const isCustomAzimuth = ref(false)
 
-function handleOpenAddTree() {
-  editingObstacle.value = {
-    type: 'Tree'
-  }
-  isObstructionModalOpen.value = true
-}
-
-function handleOpenAddObstruction() {
-  editingObstacle.value = null
-  isObstructionModalOpen.value = true
-}
-
-function handleOpenEditObstruction(obs: RoofObstacle) {
-  editingObstacle.value = { ...obs }
-  isObstructionModalOpen.value = true
-}
-
-function handleSaveObstruction(data: Partial<RoofObstacle>) {
-  if (data.id) {
-    updateObstruction(data.id, data)
-  } else {
-    addObstruction(data)
-  }
+function handleStructureTypeChange() {
+  setInstallerRoofStructureType(roofStructureType.value)
+  recalculateAll()
 }
 
 function handleOpenSolarDesignEditor() {
@@ -141,26 +114,30 @@ function handleOpenSolarDesignEditor() {
       </div>
 
       <div class="grid grid-cols-2 gap-3">
-        <!-- Roof Type -->
+        <!-- Roof Structure Type -->
         <div>
-          <label class="text-[10px] font-semibold text-slate-600 block mb-1">Roof Type</label>
+          <label class="text-[10px] font-semibold text-slate-600 block mb-1">Roof Structure Type</label>
           <select
             v-model="roofStructureType"
-            @change="recalculateAll"
+            @change="handleStructureTypeChange"
             class="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
           >
-            <option value="Flat">Flat</option>
-            <option value="Single Slope">Single Slope</option>
-            <option value="Gable">Gable</option>
-            <option value="Hip">Hip</option>
-            <option value="Custom">Custom</option>
+            <option
+              v-for="opt in roofStructureOptions"
+              :key="opt.value"
+              :value="opt.value"
+            >
+              {{ opt.label }}
+            </option>
           </select>
         </div>
 
-        <!-- Pitch -->
+        <!-- Pitch (Installer-Provided) -->
         <div>
           <div class="flex items-center justify-between mb-1">
-            <label class="text-[10px] font-semibold text-slate-600">Pitch (°)</label>
+            <label class="text-[10px] font-semibold text-slate-600">
+              Pitch (°) <span class="text-[9px] text-slate-400 font-normal">(Installer)</span>
+            </label>
             <button
               type="button"
               @click="isCustomPitch = !isCustomPitch"
@@ -197,10 +174,12 @@ function handleOpenSolarDesignEditor() {
         </div>
       </div>
 
-      <!-- Slope Direction (Azimuth) -->
+      <!-- Slope Direction / Azimuth (Installer-Provided) -->
       <div>
         <div class="flex items-center justify-between mb-1">
-          <label class="text-[10px] font-semibold text-slate-600">Slope Direction (Azimuth)</label>
+          <label class="text-[10px] font-semibold text-slate-600">
+            Azimuth (°) <span class="text-[9px] text-slate-400 font-normal">(Installer-Provided)</span>
+          </label>
           <button
             type="button"
             @click="isCustomAzimuth = !isCustomAzimuth"
@@ -414,24 +393,27 @@ function handleOpenSolarDesignEditor() {
         </div>
       </div>
 
-      <div class="space-y-1.5 text-[11px] font-mono text-slate-300">
+      <div v-if="roofBoundaryDrawn && activeRoofModel" class="space-y-1.5 text-[11px] font-mono text-slate-300">
         <div class="flex items-center justify-between">
-          <span class="text-slate-400">Google Maps Area:</span>
+          <span class="text-slate-400">Map Area:</span>
           <span class="text-white font-bold">{{ roofAreaSqM.toFixed(1) }} m²</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-slate-400">3D Footprint:</span>
-          <span class="text-white font-bold">{{ babylonFootprintAreaM2 }} m²</span>
+          <span class="text-slate-400">Babylon Footprint:</span>
+          <span class="text-white font-bold">{{ babylonFootprintAreaM2.toFixed(1) }} m²</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-slate-400">Area Discrepancy:</span>
+          <span class="text-slate-400">Discrepancy:</span>
           <span :class="isGeometryAreaValid ? 'text-emerald-400' : 'text-rose-400 font-bold'">
-            {{ areaDifferencePercent }}% {{ isGeometryAreaValid ? '(Within Tolerance)' : '(Exceeds Limit!)' }}
+            {{ areaDifferencePercent.toFixed(1) }}% {{ isGeometryAreaValid ? '(Within Tolerance)' : '(Exceeds Limit!)' }}
           </span>
         </div>
       </div>
+      <div v-else class="p-2.5 bg-slate-800/80 border border-slate-700 rounded-lg text-[11px] text-amber-300 font-medium">
+        No verified roof yet. Draw and confirm the roof first.
+      </div>
 
-      <div v-if="!isGeometryAreaValid" class="p-2 bg-rose-900/40 border border-rose-700 rounded text-[10px] text-rose-300">
+      <div v-if="roofBoundaryDrawn && activeRoofModel && !isGeometryAreaValid" class="p-2 bg-rose-900/40 border border-rose-700 rounded text-[10px] text-rose-300">
         ⚠️ 3D geometry does not match roof footprint.
       </div>
 
@@ -446,13 +428,5 @@ function handleOpenSolarDesignEditor() {
         <span>OPEN SOLAR DESIGN EDITOR</span>
       </button>
     </div>
-
-    <!-- Obstruction Edit / Create Modal -->
-    <ObstructionModal
-      :is-open="isObstructionModalOpen"
-      :initial-obstacle="editingObstacle"
-      @close="isObstructionModalOpen = false"
-      @save="handleSaveObstruction"
-    />
   </div>
 </template>

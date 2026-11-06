@@ -197,8 +197,7 @@ function formatDate(isoStr: string) {
     <!-- Header -->
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200">
       <div>
-        <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Projects Pipeline</h1>
-        <p class="text-sm text-slate-500 mt-1">Manage active solar installations across GIS assessment, rooftop 3D, and load design.</p>
+        <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Projects</h1>
       </div>
 
       <div class="flex items-center gap-2">

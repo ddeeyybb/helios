@@ -61,7 +61,6 @@ function submitSettings() {
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200">
       <div>
         <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Installer Platform Settings</h1>
-        <p class="text-sm text-slate-500 mt-1">Configure professional credentials, company branding, and engineering calculation parameters.</p>
       </div>
 
       <div class="flex items-center gap-2">

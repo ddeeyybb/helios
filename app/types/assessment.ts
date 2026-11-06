@@ -46,8 +46,16 @@ export interface PropertyLocation {
 }
 
 export type RoofTypeOption =
+  | 'Hip / Pyramid'
   | 'Gable'
+  | 'Single Slope / Shed'
+  | 'L-Shape'
+  | 'T-Shape'
+  | 'U-Shape'
+  | 'Irregular'
+  | 'Flat'
   | 'Hip'
+  | 'Single Slope'
   | 'Dutch Gable'
   | 'Hip & Valley'
   | 'Cross Gable'

@@ -11,12 +11,9 @@ import type {
   RoofFace,
   RoofPlaneGeometry,
   RooftopFeature,
-  RoofDetectionResult,
   VerifiedRoofPolygon,
   RoofAssessmentState,
-  RoofDrawingMode,
-  DetectionSource,
-  ConfidenceCategory
+  RoofDrawingMode
 } from '~/types/roof'
 import { SAMPLE_PROPERTIES, isInsideDigos } from '~/data/sampleProperties'
 import { useInstallerData } from '~/composables/useInstallerData'
@@ -34,10 +31,25 @@ import {
 } from '~/utils/panel-placement'
 import {
   buildExactRoofGeometry,
+  applyGeneratedGeometryToRoofModel,
+  hydrateOrUpgradeRoofModel,
+  extractVerifiedBoundaryLatLng,
+  extractVerifiedFootprint2D,
+  computeSphericalPolygonAreaM2,
+  inferFootprintShapeType,
+  normalizeRoofStructureType,
   latLngToLocalMeters,
+  ROOF_STRUCTURE_OPTIONS,
   type RoofStructureType,
   type GeneratedRoofGeometry
 } from '~/utils/roof-mesh-generator'
+import { snapPanelToRoofSurface } from '~/utils/roof-surface'
+import {
+  orderRoofPolygonVertices,
+  insertPointIntoRoofPerimeter,
+  SELF_INTERSECTION_ERROR_MESSAGE,
+  type PolygonCrossingInfo
+} from '~/utils/roof-polygon-order'
 
 // ==========================================
 // SINGLETON STATE ACROSS INSTALLER WORKFLOW
@@ -51,14 +63,9 @@ const currentStep = ref<number>(1)
 const isClassificationModalOpen = ref(false)
 const manualClassification = ref<RoofTypeOption | ''>('')
 
-// AI-Assisted Detection & Verification State
+// Manual Roof Boundary & Verification State
 const roofAssessmentState = ref<RoofAssessmentState>('IDLE')
 const roofDrawingMode = ref<RoofDrawingMode>('none')
-const detectionResult = ref<RoofDetectionResult | null>(null)
-const detectionConfidence = ref<number>(0)
-const detectionConfidenceCategory = ref<ConfidenceCategory>('LOW')
-const detectionSource = ref<DetectionSource>('manual')
-const detectionMessage = ref<string>('Select a property and analyze the roof.')
 const installerEditsCount = ref<number>(0)
 const pointHistory = ref<Array<Array<{ lat: number; lng: number }>>>([])
 const pointRedoHistory = ref<Array<Array<{ lat: number; lng: number }>>>([])
@@ -72,14 +79,18 @@ const roofBoundaryDrawn = ref<boolean>(false)
 const roofAreaSqM = ref<number>(0)
 const usableRoofPercent = ref<number>(80) // 80% default (options: 70%, 75%, 80%, 85%, 90%)
 const boundaryValidationMessage = ref<string>('')
+const boundaryCrossings = ref<PolygonCrossingInfo[]>([])
 
 // Roof Structure & Physical Properties (INSTALLER PROVIDED)
-const roofStructureType = ref<RoofStructureType>('Flat')
+const roofStructureType = ref<RoofStructureType>('Hip / Pyramid')
+const structureVerifiedByInstaller = ref<boolean>(false)
 const roofType = ref<RoofTypeOption | 'Custom Drawn' | 'Not detected'>('Custom Drawn')
 const roofPitchDegrees = ref<number>(15)
 const roofAzimuthDegrees = ref<number>(180) // 180° = South facing default
 const roofThicknessM = ref<number>(0.15)
 const eaveHeightM = ref<number>(3.5)
+const lastSyncedProjectId = ref<string | null>(null)
+let isHydratingFromProject = false
 
 // Multi-segment Roof Support
 const roofSegmentsList = ref<RoofSegment[]>([])
@@ -213,11 +224,16 @@ export function useSiteAssessment() {
     return calculateSolarPosition(lat, lng, d)
   })
 
-  // Area Discrepancy & Verification
-  const babylonFootprintAreaM2 = computed(() => generatedGeometry.value?.footprintAreaM2 ?? 0)
-  const areaDiscrepancy = computed(() => generatedGeometry.value?.areaDiscrepancy)
-  const areaDifferencePercent = computed(() => generatedGeometry.value?.areaDiscrepancy?.differencePercent ?? 0)
-  const isGeometryAreaValid = computed(() => generatedGeometry.value?.areaDiscrepancy?.isDiscrepancyAcceptable ?? true)
+  // Area Discrepancy & Verification (derived truthfully from active canonical geometry)
+  const babylonFootprintAreaM2 = computed(
+    () => activeRoofModel.value?.footprintAreaM2 ?? generatedGeometry.value?.footprintAreaM2 ?? 0
+  )
+  const areaDiscrepancy = computed(
+    () => activeRoofModel.value?.areaDiscrepancy ?? generatedGeometry.value?.areaDiscrepancy
+  )
+  const areaDifferencePercent = computed(() => areaDiscrepancy.value?.differencePercent ?? 0)
+  const isGeometryAreaValid = computed(() => areaDiscrepancy.value?.isDiscrepancyAcceptable ?? true)
+  const isBoundarySelfIntersecting = computed(() => boundaryCrossings.value.length > 0)
 
   // String formatted values for UI
   const roofArea = computed(() => roofAreaSqM.value > 0 ? `${roofAreaSqM.value.toFixed(1)} m²` : '--')
@@ -289,41 +305,66 @@ export function useSiteAssessment() {
   // CORE GEOMETRY & PHYSICAL PLACEMENT ENGINE
   // ==========================================
 
-  function validateBoundaryPoints(): boolean {
+  function computeAccuratePolygonArea(pts: Array<{ lat: number; lng: number }>): number {
+    if (pts.length < 3) return 0
+    if (import.meta.client && window.google?.maps?.geometry?.spherical) {
+      const path = pts.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
+      return Number(google.maps.geometry.spherical.computeArea(path).toFixed(1))
+    }
+    return Number(computeSphericalPolygonAreaM2(pts).toFixed(1))
+  }
+
+  function normalizeAndValidateBoundary(reorderInPlace = true): boolean {
     if (drawnRoofPoints.value.length < 3) {
-      boundaryValidationMessage.value = 'Invalid roof boundary. At least 3 points required.'
+      boundaryCrossings.value = []
+      boundaryValidationMessage.value = ''
+      roofAreaSqM.value = 0
       return false
     }
-    // Check for duplicate consecutive points or NaN coordinates
-    for (let i = 0; i < drawnRoofPoints.value.length; i++) {
-      const pt = drawnRoofPoints.value[i]
-      if (!pt || isNaN(pt.lat) || isNaN(pt.lng)) {
-        boundaryValidationMessage.value = 'Invalid coordinates detected in boundary.'
-        return false
-      }
-      const nextPt = drawnRoofPoints.value[(i + 1) % drawnRoofPoints.value.length]
-      if (!nextPt) continue
-      if (Math.abs(pt.lat - nextPt.lat) < 0.0000001 && Math.abs(pt.lng - nextPt.lng) < 0.0000001) {
-        boundaryValidationMessage.value = 'Duplicate consecutive vertices detected in polygon.'
-        return false
-      }
+
+    const ordered = orderRoofPolygonVertices(drawnRoofPoints.value)
+    if (reorderInPlace && ordered.wasReordered) {
+      drawnRoofPoints.value = ordered.points
     }
+
+    boundaryCrossings.value = ordered.validation.crossings
+    if (!ordered.validation.isValid) {
+      boundaryValidationMessage.value = ordered.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+      roofAreaSqM.value = 0
+      return false
+    }
+
     boundaryValidationMessage.value = ''
+    roofAreaSqM.value = computeAccuratePolygonArea(ordered.points)
     return true
   }
 
+  function validateBoundaryPoints(): boolean {
+    if (drawnRoofPoints.value.length < 3) {
+      boundaryValidationMessage.value = 'Invalid roof boundary. At least 3 points required.'
+      boundaryCrossings.value = []
+      return false
+    }
+    return normalizeAndValidateBoundary(true)
+  }
+
   /**
-   * Recalculates the complete 3D roof mesh, physical solar panel layout,
-   * and shading assessment directly from the drawn boundary.
+   * Recalculates the complete multi-plane 3D roof mesh, physical solar panel layout,
+   * and shading assessment directly from the verified drawn boundary.
    */
   async function recalculateAll() {
+    if (isHydratingFromProject) return
     if (!drawnRoofPoints.value || drawnRoofPoints.value.length < 3) return
     if (!validateBoundaryPoints()) return
 
     isGeneratingGeometry.value = true
 
     try {
-      // 1. Build Exact 3D Roof Mesh Geometry with thickness and ear-clipping
+      if (roofAreaSqM.value <= 0) {
+        recalculateAreaFromPoints()
+      }
+
+      // 1. Build Exact Multi-Plane 3D Roof Mesh Geometry with sloped slab thickness
       const geom = buildExactRoofGeometry(
         drawnRoofPoints.value,
         roofAreaSqM.value,
@@ -336,10 +377,15 @@ export function useSiteAssessment() {
         }
       )
       generatedGeometry.value = geom
+      if (roofStructureType.value !== geom.roofType) {
+        isHydratingFromProject = true
+        roofStructureType.value = geom.roofType
+        isHydratingFromProject = false
+      }
 
-      // Sync obstacle relative positions to roof centroid
-      const centerLat = selectedProperty.value?.latitude ?? 6.7497
-      const centerLng = selectedProperty.value?.longitude ?? 125.3572
+      // Exact local coordinate origin from the verified roof polygon
+      const centerLat = geom.origin.latitude
+      const centerLng = geom.origin.longitude
       obstructions.value.forEach((obs, idx) => {
         if (!obs.position) {
           obs.position = { x: 5 + idx * 3, y: eaveHeightM.value, z: -3 }
@@ -347,8 +393,8 @@ export function useSiteAssessment() {
         registerObstacleDistance(obs.id, obs.distanceFromRoofM ?? 2.0)
       })
 
-      // 2. Physical Panel Placement inside Setback Polygon avoiding Obstructions
-      const topPolygon2D = geom.topSurfaceVertices.map(v => ({ x: v.x, z: v.z }))
+      // 2. Physical Panel Placement inside Verified 2D Footprint Setback Polygon avoiding Obstructions
+      const topPolygon2D = geom.footprint2D
       const placementResult = placeSolarPanelsInsideRoof(
         topPolygon2D,
         obstructions.value,
@@ -368,21 +414,6 @@ export function useSiteAssessment() {
       // Setback polygon points outline for rendering
       setbackPolygonPoints.value = placementResult.setbackPolygon
 
-      // Do NOT automatically place panels on clean roofs!
-      // If panels already exist (from saved model or manual placement), validate them against updated geometry
-      if (placedPanels.value && placedPanels.value.length > 0) {
-        placedPanels.value = placedPanels.value.map(p => {
-          const val = validateIndividualPanel(p, topPolygon2D, setbackM.value, obstructions.value, [], placedPanels.value)
-          return {
-            ...p,
-            status: val.isValid ? 'VALID' : 'INVALID',
-            validationReason: val.reason
-          }
-        })
-      } else {
-        placedPanels.value = []
-      }
-
       // 3. Evaluate Estimated Shading Simulation
       const solPos = currentSolarPosition.value
       shadingAssessment.value = evaluateShadingAssessment(
@@ -397,49 +428,9 @@ export function useSiteAssessment() {
         eaveHeightM.value
       )
 
-      // 4. Assemble Canonical RoofModel
-      const segment: RoofSegment = {
-        id: 'roof-segment-0',
-        segmentIndex: 0,
-        pitchDegrees: roofPitchDegrees.value,
-        azimuthDegrees: roofAzimuthDegrees.value,
-        areaMeters2: roofAreaSqM.value,
-        groundAreaMeters2: geom.footprintAreaM2,
-        areaM2: roofAreaSqM.value,
-        groundAreaM2: geom.footprintAreaM2,
-        center: {
-          x: geom.centroid.x,
-          y: geom.centroid.y,
-          z: geom.centroid.z,
-          latitude: centerLat,
-          longitude: centerLng
-        },
-        vertices: geom.vertices,
-        indices: geom.indices,
-        normals: geom.normals,
-        verificationStatus: 'Installer Verified',
-        source: 'Installer Verified',
-        potentialPanels: placementResult.totalFittedPanels,
-        yearlyEnergyDcKwh: estimatedAnnualEnergyKwh.value
-      }
-
-      roofSegments.value = [segment]
-      roofSegmentsList.value = [segment]
-
-      const planeGeom: RoofPlaneGeometry = {
-        segmentIndex: 0,
-        vertices: geom.vertices,
-        faces: geom.faces,
-        normal: [0, 1, 0],
-        pitchDegrees: roofPitchDegrees.value,
-        azimuthDegrees: roofAzimuthDegrees.value,
-        elevationMeters: geom.centroid.y,
-        center: geom.centroid,
-        polygon2D: topPolygon2D
-      }
-
-      const canonicalModel: RoofModel = {
-        id: `model-${Date.now()}`,
+      // 4. Assemble Canonical v2 RoofModel
+      const baseModel: RoofModel = {
+        id: activeRoofModel.value?.id || `model-${Date.now()}`,
         buildingId: selectedProperty.value?.buildingId || 'installer-drawn-building',
         projectId: activeProject.value?.id || 'current-project',
         source: 'Installer Verified',
@@ -448,43 +439,65 @@ export function useSiteAssessment() {
           longitude: centerLng,
           elevation: eaveHeightM.value
         },
-        segments: [segment],
-        roofSegments: [segment],
+        segments: [],
+        roofSegments: [],
         obstacles: obstructions.value,
         roofFeatures: rooftopFeatures.value,
-        panels: placedPanels.value,
+        panels: [],
         geometry: {
-          vertices: geom.vertices,
-          faces: geom.faces,
-          segments: [planeGeom],
+          vertices: [],
+          faces: [],
+          segments: [],
           ridges: [],
           valleys: [],
           eaves: [],
-          bounds: {
-            minX: -geom.boundingDimensions.widthM / 2,
-            maxX: geom.boundingDimensions.widthM / 2,
-            minY: 0,
-            maxY: geom.boundingDimensions.heightM,
-            minZ: -geom.boundingDimensions.lengthM / 2,
-            maxZ: geom.boundingDimensions.lengthM / 2
-          }
-        },
-        building: {
-          center: { latitude: centerLat, longitude: centerLng },
-          areaM2: roofAreaSqM.value,
-          roofType: roofStructureType.value
+          bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0, minZ: 0, maxZ: 0 }
         },
         verification: {
           status: 'Verified',
           confidence: 'INSTALLER VERIFIED',
           verifiedBy: 'Field Solar Installer',
           verifiedDate: new Date().toISOString().split('T')[0],
-          notes: installerNotes.value || 'Accurately derived from Google Maps boundary and physical placement engine.'
+          notes: installerNotes.value || 'Accurately derived from verified Google Maps roof boundary.'
         },
         status: 'VERIFIED',
-        createdAt: new Date().toISOString(),
+        createdAt: activeRoofModel.value?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString()
       }
+
+      const canonicalModel = applyGeneratedGeometryToRoofModel(baseModel, geom, {
+        pitchDegrees: roofPitchDegrees.value,
+        azimuthDegrees: roofAzimuthDegrees.value,
+        eaveHeightM: eaveHeightM.value,
+        roofThicknessM: roofThicknessM.value,
+        structureVerifiedByInstaller: structureVerifiedByInstaller.value
+      })
+
+      if (canonicalModel.segments[0]) {
+        canonicalModel.segments[0].potentialPanels = placementResult.totalFittedPanels
+        canonicalModel.segments[0].yearlyEnergyDcKwh = estimatedAnnualEnergyKwh.value
+      }
+
+      // Do NOT automatically place panels on clean roofs!
+      // If panels already exist (from saved model or manual placement), snap & validate them against updated multi-plane geometry
+      if (placedPanels.value && placedPanels.value.length > 0) {
+        placedPanels.value = placedPanels.value.map(p => {
+          const copy = { ...p }
+          snapPanelToRoofSurface(copy, canonicalModel, null)
+          const val = validateIndividualPanel(copy, topPolygon2D, setbackM.value, obstructions.value, [], placedPanels.value)
+          return {
+            ...copy,
+            status: val.isValid ? 'VALID' : 'INVALID',
+            validationReason: val.reason
+          }
+        })
+      } else {
+        placedPanels.value = []
+      }
+      canonicalModel.panels = placedPanels.value
+
+      roofSegments.value = canonicalModel.segments
+      roofSegmentsList.value = canonicalModel.segments
 
       activeRoofModel.value = canonicalModel
       installerVerified.value = true
@@ -622,121 +635,63 @@ export function useSiteAssessment() {
   }
 
   function recalculateAreaFromPoints() {
-    if (import.meta.client && window.google?.maps?.geometry?.spherical && drawnRoofPoints.value.length >= 3) {
-      const path = drawnRoofPoints.value.map(pt => new google.maps.LatLng(pt.lat, pt.lng))
-      const area = google.maps.geometry.spherical.computeArea(path)
-      roofAreaSqM.value = Number(area.toFixed(1))
+    if (drawnRoofPoints.value.length < 3) {
+      roofAreaSqM.value = 0
+      boundaryCrossings.value = []
+      boundaryValidationMessage.value = ''
+      return
     }
+    normalizeAndValidateBoundary(true)
+  }
+
+  function inferInitialStructureFromPoints(coords: Array<{ lat: number; lng: number }>) {
+    if (structureVerifiedByInstaller.value || coords.length < 3) return
+    const avgLat = coords.reduce((s, p) => s + p.lat, 0) / coords.length
+    const avgLng = coords.reduce((s, p) => s + p.lng, 0) / coords.length
+    const localPts = coords.map(pt => latLngToLocalMeters(pt.lat, pt.lng, avgLat, avgLng))
+    roofStructureType.value = inferFootprintShapeType(localPts)
+  }
+
+  function setInstallerRoofStructureType(type: RoofStructureType) {
+    structureVerifiedByInstaller.value = true
+    roofStructureType.value = normalizeRoofStructureType(type, extractVerifiedFootprint2D(activeRoofModel.value))
   }
 
   function savePointHistorySnapshot() {
-    pointHistory.value.push([...drawnRoofPoints.value])
+    pointHistory.value.push(drawnRoofPoints.value.map(p => ({ lat: p.lat, lng: p.lng })))
     pointRedoHistory.value = []
   }
 
-  async function autoDetectRoof(coords?: { latitude: number; longitude: number; placeId?: string }): Promise<RoofDetectionResult> {
-    const targetLat = coords?.latitude ?? selectedProperty.value?.latitude
-    const targetLng = coords?.longitude ?? selectedProperty.value?.longitude
-    const targetPlaceId = coords?.placeId ?? selectedProperty.value?.placeId
-
-    if (typeof targetLat !== 'number' || typeof targetLng !== 'number') {
-      detectionMessage.value = 'Roof not detected. Please draw the roof manually.'
-      roofAssessmentState.value = 'FAILED'
-      return {
-        success: false,
-        source: 'ai-assisted',
-        message: 'Roof not detected. Please draw the roof manually.'
-      }
-    }
-
-    roofAssessmentState.value = 'DETECTING'
-    detectionMessage.value = 'Detecting roof...'
-    boundaryValidationMessage.value = ''
-
-    try {
-      const res = await $fetch<RoofDetectionResult>('/api/roofs/detect', {
-        method: 'POST',
-        body: {
-          latitude: targetLat,
-          longitude: targetLng,
-          placeId: targetPlaceId
-        }
-      })
-
-      if (res.success && res.points && res.points.length >= 3) {
-        drawnRoofPoints.value = res.points.map(p => ({ lat: p.lat, lng: p.lng }))
-        roofAreaSqM.value = res.areaM2 || 0
-        recalculateAreaFromPoints()
-        roofBoundaryDrawn.value = true
-        detectionResult.value = res
-        detectionConfidence.value = res.confidence ?? 0
-        detectionConfidenceCategory.value = res.confidenceCategory ?? 'HIGH'
-        detectionSource.value = 'ai-assisted'
-        detectionMessage.value = 'Roof detected'
-        // Open the roof editing panel with the detected points already loaded
-        roofAssessmentState.value = 'EDITING'
-        roofDrawingMode.value = 'edit-points'
-        isDrawingRoof.value = false
-        pointHistory.value = [[...drawnRoofPoints.value]]
-        pointRedoHistory.value = []
-        installerEditsCount.value = 0
-        placedPanels.value = []
-        return res
-      } else {
-        roofAssessmentState.value = 'FAILED'
-        roofDrawingMode.value = 'none'
-        isDrawingRoof.value = false
-        detectionResult.value = res
-        detectionMessage.value = 'Roof not detected. Please draw the roof manually.'
-        drawnRoofPoints.value = []
-        roofBoundaryDrawn.value = false
-        roofAreaSqM.value = 0
-        return res
-      }
-    } catch {
-      roofAssessmentState.value = 'FAILED'
-      roofDrawingMode.value = 'none'
-      isDrawingRoof.value = false
-      const failRes: RoofDetectionResult = {
-        success: false,
-        source: 'ai-assisted',
-        message: 'Roof not detected. Please draw the roof manually.'
-      }
-      detectionResult.value = failRes
-      detectionMessage.value = failRes.message!
-      drawnRoofPoints.value = []
-      roofBoundaryDrawn.value = false
-      roofAreaSqM.value = 0
-      return failRes
-    }
+  function recordDragStartSnapshot() {
+    savePointHistorySnapshot()
   }
 
   function startManualDrawRoof() {
-    roofAssessmentState.value = 'EDITING'
+    roofAssessmentState.value = 'IDLE'
     roofDrawingMode.value = 'manual-draw'
-    detectionSource.value = 'manual'
-    detectionConfidence.value = 0
     drawnRoofPoints.value = []
     roofBoundaryDrawn.value = false
     roofAreaSqM.value = 0
     isDrawingRoof.value = true
+    structureVerifiedByInstaller.value = false
     pointHistory.value = []
     pointRedoHistory.value = []
     installerEditsCount.value = 0
-    detectionMessage.value = 'Manual drawing active. Click each corner of the roof perimeter.'
     boundaryValidationMessage.value = ''
+    boundaryCrossings.value = []
   }
 
   function enterEditPointsMode() {
     if (drawnRoofPoints.value.length < 3) return
+    normalizeAndValidateBoundary(true)
     savePointHistorySnapshot()
     roofAssessmentState.value = 'EDITING'
     roofDrawingMode.value = 'edit-points'
     isDrawingRoof.value = false
-    detectionMessage.value = 'Editing roof boundary. Drag vertices, click ADD POINT to insert a point on an edge, or click a point to delete it.'
   }
 
   function toggleAddPointMode() {
+    if (drawnRoofPoints.value.length < 3) return
     if (roofDrawingMode.value === 'add-point') {
       roofDrawingMode.value = 'edit-points'
     } else {
@@ -747,11 +702,12 @@ export function useSiteAssessment() {
 
   function undoRoofPointEdit() {
     if (pointHistory.value.length > 0) {
-      pointRedoHistory.value.push([...drawnRoofPoints.value])
+      pointRedoHistory.value.push(drawnRoofPoints.value.map(p => ({ lat: p.lat, lng: p.lng })))
       const prev = pointHistory.value.pop()
       if (prev) {
-        drawnRoofPoints.value = [...prev]
+        drawnRoofPoints.value = prev.map(p => ({ lat: p.lat, lng: p.lng }))
         installerEditsCount.value++
+        selectedVertexIndex.value = null
         recalculateAreaFromPoints()
       }
     }
@@ -759,24 +715,31 @@ export function useSiteAssessment() {
 
   function redoRoofPointEdit() {
     if (pointRedoHistory.value.length > 0) {
-      pointHistory.value.push([...drawnRoofPoints.value])
+      pointHistory.value.push(drawnRoofPoints.value.map(p => ({ lat: p.lat, lng: p.lng })))
       const next = pointRedoHistory.value.pop()
       if (next) {
-        drawnRoofPoints.value = [...next]
+        drawnRoofPoints.value = next.map(p => ({ lat: p.lat, lng: p.lng }))
         installerEditsCount.value++
+        selectedVertexIndex.value = null
         recalculateAreaFromPoints()
       }
     }
   }
 
-  function insertRoofPointAt(index: number, lat: number, lng: number) {
+  function insertRoofPointAt(_index: number, lat: number, lng: number) {
     savePointHistorySnapshot()
-    drawnRoofPoints.value.splice(index, 0, {
-      lat,
-      lng
-    })
+    const inserted = insertPointIntoRoofPerimeter(drawnRoofPoints.value, { lat, lng })
+    drawnRoofPoints.value = inserted.points
+    selectedVertexIndex.value = inserted.insertedIndex
     installerEditsCount.value++
-    recalculateAreaFromPoints()
+    boundaryCrossings.value = inserted.validation.crossings
+    if (!inserted.validation.isValid) {
+      boundaryValidationMessage.value = inserted.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+      roofAreaSqM.value = 0
+    } else {
+      boundaryValidationMessage.value = ''
+      roofAreaSqM.value = computeAccuratePolygonArea(inserted.points)
+    }
   }
 
   function deleteRoofPointAt(index: number): boolean {
@@ -787,8 +750,8 @@ export function useSiteAssessment() {
     savePointHistorySnapshot()
     drawnRoofPoints.value.splice(index, 1)
     installerEditsCount.value++
-    boundaryValidationMessage.value = ''
-    recalculateAreaFromPoints()
+    selectedVertexIndex.value = null
+    normalizeAndValidateBoundary(true)
     return true
   }
 
@@ -798,7 +761,13 @@ export function useSiteAssessment() {
       return false
     }
 
-    recalculateAreaFromPoints()
+    const isValid = normalizeAndValidateBoundary(true)
+    if (!isValid) {
+      boundaryValidationMessage.value = SELF_INTERSECTION_ERROR_MESSAGE
+      return false
+    }
+
+    inferInitialStructureFromPoints(drawnRoofPoints.value)
     isDrawingRoof.value = false
     roofBoundaryDrawn.value = true
     roofAssessmentState.value = 'CONFIRMED'
@@ -806,23 +775,20 @@ export function useSiteAssessment() {
     roofAssessmentStatus.value = 'Verified'
 
     verifiedRoofData.value = {
-      source: detectionSource.value,
-      confidence: detectionConfidence.value,
-      confidenceCategory: detectionConfidenceCategory.value,
+      source: 'manual',
       verified: true,
       verifiedBy: 'Lead PV System Designer',
       verifiedAt: new Date().toISOString(),
-      detectedAt: detectionResult.value?.detectedAt,
       installerEditsCount: installerEditsCount.value,
       points: [...drawnRoofPoints.value],
       areaM2: roofAreaSqM.value
     }
 
-    // Rebuild canonical 3D geometry in Babylon
-    await recalculateAll()
-
-    // Strictly ZERO auto-placed panels and ZERO auto-placed trees
+    // Strictly ZERO auto-placed panels and ZERO auto-placed trees on newly confirmed roof
     placedPanels.value = []
+
+    // Rebuild canonical multi-plane 3D geometry in Babylon
+    await recalculateAll()
 
     return true
   }
@@ -845,50 +811,131 @@ export function useSiteAssessment() {
 
   function addRoofPoint(lat: number, lng: number) {
     savePointHistorySnapshot()
-    drawnRoofPoints.value.push({
-      lat,
-      lng
-    })
+    if (drawnRoofPoints.value.length < 3) {
+      drawnRoofPoints.value.push({ lat, lng })
+      installerEditsCount.value++
+      if (drawnRoofPoints.value.length === 3) {
+        normalizeAndValidateBoundary(true)
+      } else {
+        boundaryCrossings.value = []
+        boundaryValidationMessage.value = ''
+      }
+      return
+    }
+
+    const inserted = insertPointIntoRoofPerimeter(drawnRoofPoints.value, { lat, lng })
+    drawnRoofPoints.value = inserted.points
     installerEditsCount.value++
+    boundaryCrossings.value = inserted.validation.crossings
+    if (!inserted.validation.isValid) {
+      boundaryValidationMessage.value = inserted.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+      roofAreaSqM.value = 0
+    } else {
+      boundaryValidationMessage.value = ''
+      roofAreaSqM.value = computeAccuratePolygonArea(inserted.points)
+    }
   }
 
-  function updateRoofPoint(index: number, lat: number, lng: number) {
-    if (drawnRoofPoints.value[index]) {
-      drawnRoofPoints.value[index] = {
-        lat,
-        lng
+  function updateRoofPoint(index: number, lat: number, lng: number, finalizeOrder = false) {
+    if (!drawnRoofPoints.value[index]) return
+    drawnRoofPoints.value[index] = { lat, lng }
+    installerEditsCount.value++
+
+    if (drawnRoofPoints.value.length < 3) return
+
+    if (finalizeOrder) {
+      const ordered = orderRoofPolygonVertices(drawnRoofPoints.value)
+      if (ordered.wasReordered) {
+        drawnRoofPoints.value = ordered.points
+        const newIdx = ordered.originalIndices.indexOf(index)
+        if (selectedVertexIndex.value === index && newIdx !== -1) {
+          selectedVertexIndex.value = newIdx
+        }
       }
-      installerEditsCount.value++
+      boundaryCrossings.value = ordered.validation.crossings
+      if (!ordered.validation.isValid) {
+        boundaryValidationMessage.value = ordered.validation.message || SELF_INTERSECTION_ERROR_MESSAGE
+        roofAreaSqM.value = 0
+      } else {
+        boundaryValidationMessage.value = ''
+        roofAreaSqM.value = computeAccuratePolygonArea(ordered.points)
+      }
+    } else {
+      normalizeAndValidateBoundary(false)
     }
   }
 
   function undoLastRoofPoint() {
+    if (pointHistory.value.length > 0) {
+      const prev = pointHistory.value.pop()
+      if (prev) {
+        drawnRoofPoints.value = prev.map(p => ({ lat: p.lat, lng: p.lng }))
+        installerEditsCount.value++
+        if (drawnRoofPoints.value.length >= 3) {
+          normalizeAndValidateBoundary(true)
+        } else {
+          roofAreaSqM.value = 0
+          boundaryCrossings.value = []
+          boundaryValidationMessage.value = ''
+        }
+      }
+      return
+    }
     if (drawnRoofPoints.value.length > 0) {
-      savePointHistorySnapshot()
       drawnRoofPoints.value.pop()
       installerEditsCount.value++
+      if (drawnRoofPoints.value.length >= 3) {
+        normalizeAndValidateBoundary(true)
+      } else {
+        roofAreaSqM.value = 0
+        boundaryCrossings.value = []
+        boundaryValidationMessage.value = ''
+      }
     }
   }
 
-  async function finishRoof(calculatedAreaM2?: number) {
+  async function finishRoof(_calculatedAreaM2?: number): Promise<boolean> {
     if (drawnRoofPoints.value.length < 3) {
       boundaryValidationMessage.value = 'Please click at least 3 points around the roof boundary.'
-      throw new Error('Please draw at least 3 roof points to complete the boundary.')
+      return false
+    }
+
+    const isValid = normalizeAndValidateBoundary(true)
+    if (!isValid) {
+      boundaryValidationMessage.value = SELF_INTERSECTION_ERROR_MESSAGE
+      return false
     }
 
     isDrawingRoof.value = false
     roofBoundaryDrawn.value = true
+    roofAssessmentState.value = 'CONFIRMED'
+    roofDrawingMode.value = 'none'
+    roofAssessmentStatus.value = 'Verified'
 
-    if (calculatedAreaM2 !== undefined && calculatedAreaM2 > 0) {
-      roofAreaSqM.value = Number(calculatedAreaM2.toFixed(1))
+    inferInitialStructureFromPoints(drawnRoofPoints.value)
+
+    verifiedRoofData.value = {
+      source: 'manual',
+      verified: true,
+      verifiedBy: 'Lead PV System Designer',
+      verifiedAt: new Date().toISOString(),
+      installerEditsCount: installerEditsCount.value,
+      points: [...drawnRoofPoints.value],
+      areaM2: roofAreaSqM.value
     }
 
     await recalculateAll()
+    return true
   }
 
   function clearRoof() {
     isDrawingRoof.value = false
     roofBoundaryDrawn.value = false
+    roofAssessmentState.value = 'IDLE'
+    roofDrawingMode.value = 'none'
+    selectedVertexIndex.value = null
+    pointHistory.value = []
+    pointRedoHistory.value = []
     drawnRoofPoints.value = []
     roofAreaSqM.value = 0
     activeRoofModel.value = null
@@ -902,6 +949,7 @@ export function useSiteAssessment() {
     generatedGeometry.value = null
     installerVerified.value = false
     boundaryValidationMessage.value = ''
+    boundaryCrossings.value = []
     roofAssessmentStatus.value = selectedProperty.value ? 'In Progress' : 'Not analyzed'
 
     debugMetrics.value.roofBoundaryStatus = 'NOT_DRAWN'
@@ -1003,10 +1051,79 @@ export function useSiteAssessment() {
     recalculateAll()
   }
 
+  function hydrateStateFromProjectModel(rawModel?: RoofModel | null) {
+    if (isDrawingRoof.value) return
+    const upgraded = hydrateOrUpgradeRoofModel(rawModel)
+    if (!upgraded) {
+      clearRoof()
+      return
+    }
+
+    isHydratingFromProject = true
+    try {
+      const boundary = extractVerifiedBoundaryLatLng(upgraded)
+      const mapArea =
+        upgraded.mapAreaM2 ||
+        upgraded.areaDiscrepancy?.googleAreaM2 ||
+        upgraded.building?.areaM2 ||
+        computeSphericalPolygonAreaM2(boundary)
+
+      activeRoofModel.value = upgraded
+      drawnRoofPoints.value = boundary
+      roofBoundaryDrawn.value = boundary.length >= 3
+      roofAreaSqM.value = Number(mapArea.toFixed(1))
+      roofStructureType.value = normalizeRoofStructureType(
+        upgraded.roofType || upgraded.building?.roofType,
+        upgraded.footprint2D
+      )
+      structureVerifiedByInstaller.value = Boolean(upgraded.structureVerifiedByInstaller)
+      roofPitchDegrees.value = upgraded.pitchDegrees ?? upgraded.segments?.[0]?.pitchDegrees ?? 15
+      roofAzimuthDegrees.value = upgraded.azimuthDegrees ?? upgraded.segments?.[0]?.azimuthDegrees ?? 180
+      roofThicknessM.value = upgraded.roofThicknessM ?? 0.15
+      eaveHeightM.value = upgraded.eaveHeightM ?? upgraded.origin?.elevation ?? 3.5
+
+      roofSegments.value = upgraded.segments || []
+      roofSegmentsList.value = upgraded.segments || []
+      obstructions.value = upgraded.obstacles || []
+      rooftopFeatures.value = upgraded.roofFeatures || []
+      placedPanels.value = upgraded.panels || []
+      roofAssessmentState.value = 'CONFIRMED'
+      roofDrawingMode.value = 'none'
+      roofAssessmentStatus.value = 'Verified'
+      installerVerified.value = true
+
+      if (boundary.length >= 3) {
+        generatedGeometry.value = buildExactRoofGeometry(boundary, roofAreaSqM.value, {
+          pitchDegrees: roofPitchDegrees.value,
+          azimuthDegrees: roofAzimuthDegrees.value,
+          eaveHeightM: eaveHeightM.value,
+          roofThicknessM: roofThicknessM.value,
+          roofType: roofStructureType.value,
+          originLat: upgraded.origin?.latitude,
+          originLng: upgraded.origin?.longitude
+        })
+      }
+    } finally {
+      isHydratingFromProject = false
+    }
+  }
+
+  // Keep singleton state synchronized with the active project's verified roof model
+  watch(
+    () => activeProject.value?.id,
+    newId => {
+      if ((newId ?? null) === lastSyncedProjectId.value) return
+      lastSyncedProjectId.value = newId ?? null
+      hydrateStateFromProjectModel(activeProject.value?.roofModel)
+    },
+    { immediate: true }
+  )
+
   // Watchers to trigger real-time updates when installer changes assumptions
   watch(
     [roofStructureType, roofPitchDegrees, roofAzimuthDegrees, roofThicknessM, setbackM, usableRoofPercent, panelOrientation, panelWattageW],
     () => {
+      if (isHydratingFromProject || isGeneratingGeometry.value) return
       if (roofBoundaryDrawn.value && drawnRoofPoints.value.length >= 3) {
         recalculateAll()
       }
@@ -1121,55 +1238,13 @@ export function useSiteAssessment() {
   function applyManualClassification(type: RoofTypeOption) {
     manualClassification.value = type
     roofType.value = type
+    setInstallerRoofStructureType(type as RoofStructureType)
     isClassificationModalOpen.value = false
-  }
-
-  async function createManualRoofModel(config: {
-    roofType?: RoofTypeOption | string
-    lengthM?: number
-    widthM?: number
-    pitchDegrees?: number
-    azimuthDegrees?: number
-    eaveHeightM?: number
-  }) {
-    if (!selectedProperty.value) return
-    const lat = selectedProperty.value.latitude
-    const lng = selectedProperty.value.longitude
-    const halfW = (config.widthM || 10) / 2
-    const halfL = (config.lengthM || 14) / 2
-    const mToLat = 1 / 111320
-    const mToLng = 1 / (111320 * Math.cos(lat * Math.PI / 180))
-
-    // Form a rectangular or multi-point polygon around property pin
-    drawnRoofPoints.value = [
-      { lat: lat + halfL * mToLat, lng: lng - halfW * mToLng },
-      { lat: lat + halfL * mToLat, lng: lng + halfW * mToLng },
-      { lat: lat - halfL * mToLat, lng: lng + halfW * mToLng },
-      { lat: lat - halfL * mToLat, lng: lng - halfW * mToLng }
-    ]
-    roofAreaSqM.value = (config.widthM || 10) * (config.lengthM || 14)
-    roofPitchDegrees.value = config.pitchDegrees || 22
-    roofAzimuthDegrees.value = config.azimuthDegrees || 180
-    roofStructureType.value = (config.roofType as any) || 'Gable'
-    roofBoundaryDrawn.value = true
-    await recalculateAll()
-  }
-
-  async function saveManualModelDirectly(model: RoofModel) {
-    activeRoofModel.value = model
-    roofSegments.value = model.roofSegments
-    rooftopFeatures.value = model.roofFeatures || []
-    installerVerified.value = true
-    roofAssessmentStatus.value = 'Verified'
-    roofType.value = (model.building?.roofType as any) || 'Custom Drawn'
-    roofAreaSqM.value = model.building?.areaM2 || 140
-    await recalculateAll()
-    return true
   }
 
   function autoArrangePanels() {
     if (!generatedGeometry.value) return 0
-    const topPolygon2D = generatedGeometry.value.topSurfaceVertices.map(v => ({ x: v.x, z: v.z }))
+    const topPolygon2D = generatedGeometry.value.footprint2D
     const placementResult = placeSolarPanelsInsideRoof(
       topPolygon2D,
       obstructions.value,
@@ -1185,7 +1260,13 @@ export function useSiteAssessment() {
         eaveHeightM: eaveHeightM.value
       }
     )
-    placedPanels.value = placementResult.placedPanels
+    placedPanels.value = placementResult.placedPanels.map(p => {
+      const copy = { ...p }
+      if (activeRoofModel.value) {
+        snapPanelToRoofSurface(copy, activeRoofModel.value, null)
+      }
+      return copy
+    })
     return placementResult.totalFittedPanels
   }
 
@@ -1200,6 +1281,10 @@ export function useSiteAssessment() {
     roofAssessmentStatus,
     roofType,
     roofStructureType,
+    structureVerifiedByInstaller,
+    roofStructureOptions: ROOF_STRUCTURE_OPTIONS,
+    setInstallerRoofStructureType,
+    hydrateStateFromProjectModel,
     roofArea,
     roofPitch,
     usableArea,
@@ -1265,23 +1350,20 @@ export function useSiteAssessment() {
     areaDifferencePercent,
     isGeometryAreaValid,
     boundaryValidationMessage,
+    boundaryCrossings,
+    isBoundarySelfIntersecting,
+    recordDragStartSnapshot,
     // Debug & Diagnostics
     debugMetrics,
     debugPanelVisible,
-    // AI-Assisted Roof Boundary Workflow
+    // Manual Roof Boundary Workflow
     roofAssessmentState,
     roofDrawingMode,
-    detectionResult,
-    detectionConfidence,
-    detectionConfidenceCategory,
-    detectionSource,
-    detectionMessage,
     installerEditsCount,
     pointHistory,
     pointRedoHistory,
     selectedVertexIndex,
     verifiedRoofData,
-    autoDetectRoof,
     startManualDrawRoof,
     enterEditPointsMode,
     toggleAddPointMode,
@@ -1311,8 +1393,6 @@ export function useSiteAssessment() {
     autoArrangePanels,
     clearAllPanels,
     theoreticalMaxPanels,
-    createManualRoofModel,
-    saveManualModelDirectly,
     saveRoofModel,
     saveVerifiedRoofModel,
     verifyRoofData,

@@ -148,13 +148,7 @@ function saveManualSolarEstimate() {
       <div>
         <div class="flex items-center gap-2">
           <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Solar Potential & Irradiance Analysis</h1>
-          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-            Regional Solar Model + ECharts
-          </span>
         </div>
-        <p class="text-sm text-slate-500 mt-1">
-          Rooftop solar insolation metrics, annual energy yield estimates, and orientation telemetry.
-        </p>
       </div>
 
       <div class="flex items-center gap-2">

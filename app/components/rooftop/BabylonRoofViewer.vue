@@ -26,7 +26,11 @@ import {
 import earcut from 'earcut'
 import type { RoofModel, RoofSegment, RoofObstacle, PlacedSolarPanel, ShadingAssessmentRecord, ObstacleType, RooftopFeature, RooftopFeatureType } from '~/types/roof'
 import { useSiteAssessment } from '~/composables/useSiteAssessment'
-import { latLngToLocalMeters } from '~/utils/roof-mesh-generator'
+import {
+  latLngToLocalMeters,
+  extractVerifiedFootprint2D,
+  computeLocalPolygonArea
+} from '~/utils/roof-mesh-generator'
 import {
   snapPanelPosition,
   validateIndividualPanel,
@@ -61,12 +65,16 @@ const props = withDefaults(
     panelOrientation?: 'portrait' | 'landscape'
     panelWidthM?: number
     panelLengthM?: number
+    panelThicknessM?: number
     panelSpacingM?: number
     panelSetbackM?: number
+    panelManufacturer?: string
+    panelModelName?: string
     snapEnabled?: boolean
     gridSnapEnabled?: boolean
     shadowExclusionEnabled?: boolean
     showRoofContactDebug?: boolean
+    fullscreenTarget?: HTMLElement | null
   }>(),
   {
     roofModel: null,
@@ -88,12 +96,16 @@ const props = withDefaults(
     panelOrientation: 'portrait',
     panelWidthM: 1.134,
     panelLengthM: 2.278,
+    panelThicknessM: 0.035,
     panelSpacingM: 0.05,
     panelSetbackM: 0.5,
+    panelManufacturer: 'Trina Solar',
+    panelModelName: 'Vertex S+ TSM-NEG9R.28 440W',
     snapEnabled: true,
     gridSnapEnabled: true,
     shadowExclusionEnabled: false,
-    showRoofContactDebug: false
+    showRoofContactDebug: false,
+    fullscreenTarget: null
   }
 )
 
@@ -111,28 +123,21 @@ const emit = defineEmits<{
   (e: 'delete-selected'): void
   (e: 'extend-row', count?: number): void
   (e: 'preview-hover', payload: { isValid: boolean; reason?: string; x: number; y: number; z: number } | null): void
+  (e: 'fullscreen-change', isFullscreen: boolean): void
 }>()
 
 const {
   placedPanels,
   obstructions,
   roofThicknessM,
-  roofPitchDegrees,
-  roofAzimuthDegrees,
-  roofStructureType,
-  setbackM,
-  setbackPolygonPoints,
-  babylonFootprintAreaM2,
-  roofAreaSqM,
-  areaDifferencePercent,
-  isGeometryAreaValid
+  setbackM
 } = useSiteAssessment()
 
 const currentObstaclesList = computed(() => {
-  return ((props.roofModel?.obstacles?.length ? props.roofModel.obstacles : obstructions.value) as RoofObstacle[]) || []
+  return ((props.roofModel ? (props.roofModel.obstacles || []) : obstructions.value) as RoofObstacle[]) || []
 })
 const currentPanelsList = computed(() => {
-  return ((props.roofModel?.panels?.length ? props.roofModel.panels : placedPanels.value) as PlacedSolarPanel[]) || []
+  return ((props.roofModel ? (props.roofModel.panels || []) : placedPanels.value) as PlacedSolarPanel[]) || []
 })
 const currentFeaturesList = computed(() => {
   return ((props.roofModel?.roofFeatures as RooftopFeature[]) || [])
@@ -141,7 +146,32 @@ const currentFeaturesCount = computed(() => currentFeaturesList.value.length)
 const currentTreesCount = computed(() => currentObstaclesList.value.filter(o => o.type === 'Tree').length)
 const currentNonTreeObstaclesCount = computed(() => currentObstaclesList.value.filter(o => o.type !== 'Tree').length)
 
+// Truthful Geometry & Area Validation Metrics derived strictly from active RoofModel
+const modelFootprint2D = computed(() => extractVerifiedFootprint2D(props.roofModel))
+const displayBabylonAreaM2 = computed(() =>
+  modelFootprint2D.value.length >= 3 ? computeLocalPolygonArea(modelFootprint2D.value) : 0
+)
+const displayMapAreaM2 = computed(() =>
+  props.roofModel?.mapAreaM2 ||
+  props.roofModel?.areaDiscrepancy?.googleAreaM2 ||
+  props.roofModel?.building?.areaM2 ||
+  displayBabylonAreaM2.value
+)
+const displayDiscrepancyPercent = computed(() => {
+  if (displayMapAreaM2.value <= 0 || displayBabylonAreaM2.value <= 0) return 0
+  return Number(((Math.abs(displayMapAreaM2.value - displayBabylonAreaM2.value) / displayMapAreaM2.value) * 100).toFixed(1))
+})
+const displayAreaValid = computed(() => displayDiscrepancyPercent.value <= 2.0)
+const displayRoofThicknessM = computed(() => props.roofModel?.roofThicknessM ?? roofThicknessM.value ?? 0.15)
+const displaySetbackM = computed(() => props.panelSetbackM ?? setbackM.value ?? 0.5)
+
+const viewerContainerRef = ref<HTMLDivElement | null>(null)
 const canvasRef = ref<HTMLCanvasElement | null>(null)
+const isFullscreen = ref(false)
+const fullscreenUnavailableMessage = ref('')
+let fullscreenNoticeTimer: ReturnType<typeof setTimeout> | null = null
+let containerResizeObserver: ResizeObserver | null = null
+let resizeRafId: number | null = null
 let engine: Engine | null = null
 let scene: Scene | null = null
 let camera: ArcRotateCamera | null = null
@@ -159,7 +189,8 @@ let panelMeshes: Mesh[] = []
 let obstacleMeshes: Mesh[] = []
 let featureMeshes: Mesh[] = []
 let shadowMeshes: Mesh[] = []
-const edgeMeshes: LinesMesh[] = []
+let roofEdgeMeshes: LinesMesh[] = []
+let setbackLineMesh: LinesMesh | null = null
 let measurementLineMesh: LinesMesh | null = null
 let measurePointAMesh: Mesh | null = null
 let measurePointBMesh: Mesh | null = null
@@ -258,13 +289,13 @@ function initBabylon() {
 
     // Ambient Hemispheric Light
     const hemiLight = new HemisphericLight('HemiLight', new Vector3(0, 1, 0), scene)
-    hemiLight.intensity = 0.75
-    hemiLight.groundColor = new Color3(0.15, 0.2, 0.3)
+    hemiLight.intensity = 0.65
+    hemiLight.groundColor = new Color3(0.14, 0.19, 0.28)
 
     // Directional Sun Light
-    sunLight = new DirectionalLight('SunLight', new Vector3(-0.5, -1, -0.5), scene)
-    sunLight.position = new Vector3(20, 35, 20)
-    sunLight.intensity = 1.3
+    sunLight = new DirectionalLight('SunLight', new Vector3(-0.55, -0.95, -0.42), scene)
+    sunLight.position = new Vector3(22, 38, 18)
+    sunLight.intensity = 1.45
 
     // Ground Grid Datum Plane
     const ground = MeshBuilder.CreateGround('GridDatum', { width: 90, height: 90, subdivisions: 45 }, scene)
@@ -292,6 +323,7 @@ function initBabylon() {
 
     // Build Scene Geometry
     buildAll3DObjects()
+    updateCameraLimitsAndTarget(true)
 
     // Register Pointer Interactions (Picking, Gizmo Drags, Vertex Edit, Click-to-Place, Measure)
     setupPointerInteractions()
@@ -314,8 +346,9 @@ function initMaterials() {
   if (!scene) return
 
   defaultMaterial = new StandardMaterial('DefaultRoofMat', scene)
-  defaultMaterial.diffuseColor = new Color3(0.24, 0.33, 0.46) // Engineering slate blue
-  defaultMaterial.specularColor = new Color3(0.15, 0.15, 0.15)
+  defaultMaterial.diffuseColor = new Color3(0.28, 0.39, 0.54) // Engineering slate blue with clear facet contrast
+  defaultMaterial.specularColor = new Color3(0.18, 0.20, 0.24)
+  defaultMaterial.emissiveColor = new Color3(0.02, 0.03, 0.05)
   defaultMaterial.backFaceCulling = false
 
   selectedRoofMaterial = new StandardMaterial('SelectedRoofMat', scene)
@@ -415,6 +448,122 @@ function handleResize() {
   engine?.resize()
 }
 
+function scheduleBabylonResize() {
+  handleResize()
+  if (import.meta.client && typeof window.requestAnimationFrame === 'function') {
+    if (resizeRafId !== null) {
+      window.cancelAnimationFrame(resizeRafId)
+    }
+    resizeRafId = window.requestAnimationFrame(() => {
+      resizeRafId = null
+      handleResize()
+    })
+  }
+}
+
+function getActiveFullscreenElement(): Element | null {
+  if (!import.meta.client || typeof document === 'undefined') return null
+  return document.fullscreenElement || (document as any).webkitFullscreenElement || null
+}
+
+function getFullscreenTargetElement(): HTMLElement | null {
+  return props.fullscreenTarget || viewerContainerRef.value
+}
+
+function clearFullscreenNotice() {
+  if (fullscreenNoticeTimer) {
+    clearTimeout(fullscreenNoticeTimer)
+    fullscreenNoticeTimer = null
+  }
+  fullscreenUnavailableMessage.value = ''
+}
+
+function showFullscreenUnavailableNotice() {
+  clearFullscreenNotice()
+  fullscreenUnavailableMessage.value = 'Fullscreen is not available in this browser.'
+  fullscreenNoticeTimer = setTimeout(() => {
+    fullscreenUnavailableMessage.value = ''
+    fullscreenNoticeTimer = null
+  }, 4000)
+}
+
+function handleFullscreenChange() {
+  const fsEl = getActiveFullscreenElement()
+  const viewerEl = viewerContainerRef.value
+  const targetEl = props.fullscreenTarget
+
+  const nextFullscreen = Boolean(
+    fsEl &&
+    (fsEl === targetEl ||
+      fsEl === viewerEl ||
+      (viewerEl && fsEl.contains(viewerEl)))
+  )
+
+  isFullscreen.value = nextFullscreen
+  emit('fullscreen-change', nextFullscreen)
+  scheduleBabylonResize()
+}
+
+async function toggleFullscreen() {
+  if (!import.meta.client || typeof document === 'undefined') return
+  clearFullscreenNotice()
+
+  const activeFsEl = getActiveFullscreenElement()
+  if (activeFsEl) {
+    try {
+      if (typeof document.exitFullscreen === 'function') {
+        await document.exitFullscreen()
+      } else if (typeof (document as any).webkitExitFullscreen === 'function') {
+        await (document as any).webkitExitFullscreen()
+      } else {
+        showFullscreenUnavailableNotice()
+      }
+    } catch {
+      handleFullscreenChange()
+    }
+    return
+  }
+
+  const targetEl = getFullscreenTargetElement()
+  const standardSupported = Boolean(
+    targetEl &&
+    typeof targetEl.requestFullscreen === 'function' &&
+    document.fullscreenEnabled !== false
+  )
+  const webkitSupported = Boolean(
+    targetEl &&
+    typeof (targetEl as any).webkitRequestFullscreen === 'function' &&
+    (document as any).webkitFullscreenEnabled !== false
+  )
+
+  if (!targetEl || (!standardSupported && !webkitSupported)) {
+    showFullscreenUnavailableNotice()
+    return
+  }
+
+  try {
+    if (typeof targetEl.requestFullscreen === 'function') {
+      await targetEl.requestFullscreen()
+    } else if (typeof (targetEl as any).webkitRequestFullscreen === 'function') {
+      await (targetEl as any).webkitRequestFullscreen()
+    }
+  } catch {
+    showFullscreenUnavailableNotice()
+  }
+}
+
+function disposeRootNodesByPrefix(prefix: string) {
+  for (const [key, node] of rootNodesMap.entries()) {
+    if (key.startsWith(prefix)) {
+      if (gizmoManager?.attachedNode === node) {
+        gizmoManager.attachToNode(null)
+      }
+      node.dispose()
+      rootNodesMap.delete(key)
+    }
+  }
+}
+
 function clearAllMeshes() {
   if (highlightLayer) {
     highlightLayer.removeAllMeshes()
@@ -445,8 +594,13 @@ function clearAllMeshes() {
   shadowMeshes.forEach(mesh => mesh.dispose())
   shadowMeshes = []
 
-  edgeMeshes.forEach(mesh => mesh.dispose())
-  edgeMeshes.length = 0
+  roofEdgeMeshes.forEach(mesh => mesh.dispose())
+  roofEdgeMeshes = []
+
+  if (setbackLineMesh) {
+    setbackLineMesh.dispose()
+    setbackLineMesh = null
+  }
 
   if (measurementLineMesh) {
     measurementLineMesh.dispose()
@@ -477,10 +631,23 @@ function buildAll3DObjects() {
 }
 
 /**
- * 1. Build Exact 3D Roof Solid Mesh from polygon vertices using earcut triangulation & thickness.
+ * 1. Build Exact 3D Multi-Plane Roof Solid Mesh from verified polygon vertices, ridge lines, & sloped slab thickness.
  */
 function buildExactRoofMesh() {
   if (!scene) return
+
+  // Always dispose previous roof segment meshes & CAD edge lines before rebuilding
+  segmentMeshes.forEach(mesh => {
+    if (highlightLayer) highlightLayer.removeMesh(mesh)
+    if (gizmoManager?.attachedMesh === mesh) gizmoManager.attachToMesh(null)
+    mesh.dispose()
+  })
+  segmentMeshes.clear()
+  disposeRootNodesByPrefix('RoofSegment_')
+
+  roofEdgeMeshes.forEach(mesh => mesh.dispose())
+  roofEdgeMeshes = []
+
   const model = props.roofModel
   const segs = model?.segments || model?.roofSegments || []
   if (!model || segs.length === 0) return
@@ -510,8 +677,7 @@ function buildExactRoofMesh() {
           const b = tri[i + 1]
           const c = tri[i + 2]
           if (a !== undefined && b !== undefined && c !== undefined) {
-            indices.push(a, b, c)
-            indices.push(a, c, b)
+            indices.push(c, b, a)
           }
         }
       }
@@ -529,6 +695,8 @@ function buildExactRoofMesh() {
       vertexData.indices = indices
       vertexData.normals = normals
       vertexData.applyToMesh(segMesh)
+      segMesh.refreshBoundingInfo()
+      segMesh.computeWorldMatrix(true)
 
       const isSelected = props.selectedObjectType === 'roof' && (props.selectedObjectId === seg.id || props.selectedObjectId === `seg-${segIdx}`)
       segMesh.material = isSelected ? selectedRoofMaterial : defaultMaterial
@@ -536,48 +704,89 @@ function buildExactRoofMesh() {
       segmentMeshes.set(segIdx, segMesh)
       rootNodesMap.set(`RoofSegment_${segIdx}`, segMesh)
 
-      // Outer Perimeter Wireframe Edge Lines
-      if (seg.vertices && seg.vertices.length >= 3) {
-        const topPerimeterPts = seg.vertices
-          .slice(0, Math.floor(seg.vertices.length / 2))
-          .map(v => new Vector3(v.x, v.y + 0.02, v.z))
-        if (topPerimeterPts.length > 2) {
-          topPerimeterPts.push(topPerimeterPts[0]!.clone())
-          const edgeLine = MeshBuilder.CreateLines(`edge_top_${segIdx}`, { points: topPerimeterPts }, scene!)
-          edgeLine.color = new Color3(0.2, 0.45, 0.85)
-          edgeLine.isPickable = false
-          edgeMeshes.push(edgeLine)
-        }
+      // 1a. Outer Eave / Perimeter CAD Wireframe Line
+      const perimPts = (seg.perimeter3D && seg.perimeter3D.length >= 3)
+        ? seg.perimeter3D.map(v => new Vector3(v.x, v.y + 0.02, v.z))
+        : extractVerifiedFootprint2D(model, seg).map(p => new Vector3(p.x, (seg.eaveHeightM ?? 3.5) + 0.02, p.z))
+
+      if (perimPts.length >= 3) {
+        perimPts.push(perimPts[0]!.clone())
+        const edgeLine = MeshBuilder.CreateLines(`edge_top_${segIdx}`, { points: perimPts }, scene!)
+        edgeLine.color = new Color3(0.28, 0.56, 0.92)
+        edgeLine.isPickable = false
+        roofEdgeMeshes.push(edgeLine)
+      }
+
+      // 1b. Ridge, Hip, and Valley Crease Lines for Multi-Plane Roofs (Hip / Pyramid, Gable, L/T/U/Irregular)
+      if (seg.ridgeLines && seg.ridgeLines.length > 0) {
+        seg.ridgeLines.forEach((line, rIdx) => {
+          const [pA, pB] = line
+          if (!pA || !pB) return
+          const ridgeMesh = MeshBuilder.CreateLines(
+            `ridge_${segIdx}_${rIdx}`,
+            {
+              points: [
+                new Vector3(pA.x, pA.y + 0.025, pA.z),
+                new Vector3(pB.x, pB.y + 0.025, pB.z)
+              ]
+            },
+            scene!
+          )
+          ridgeMesh.color = new Color3(0.45, 0.78, 1.0)
+          ridgeMesh.isPickable = false
+          roofEdgeMeshes.push(ridgeMesh)
+        })
       }
     }
   })
 }
 
 /**
- * 2. Build Setback Usable Solar Area Outline.
+ * 2. Build Setback Usable Solar Area Outline draped onto the sloped roof facets.
  */
 function buildSetbackOutline() {
-  if (!scene || !props.showSetback || !setbackPolygonPoints.value || setbackPolygonPoints.value.length < 3) return
-  const model = props.roofModel
-  const seg = model?.segments?.[0] || model?.roofSegments?.[0]
-  const eaveY = seg?.center?.y ?? 3.5
+  if (setbackLineMesh) {
+    setbackLineMesh.dispose()
+    setbackLineMesh = null
+  }
+  if (!scene || !props.showSetback || modelFootprint2D.value.length < 3) return
 
-  const setbackPts = setbackPolygonPoints.value.map(pt => new Vector3(pt.x, eaveY + 0.04, pt.z))
-  setbackPts.push(setbackPts[0]!.clone())
+  const setbackPoly = computeSetbackPolygon(modelFootprint2D.value, displaySetbackM.value)
+  if (!setbackPoly || setbackPoly.length < 3) return
 
-  const setbackLine = MeshBuilder.CreateLines('setback_outline', { points: setbackPts }, scene)
-  setbackLine.color = new Color3(0.06, 0.75, 0.9) // Cyan glowing line
-  setbackLine.isPickable = false
-  edgeMeshes.push(setbackLine)
+  const setbackPts: Vector3[] = []
+  for (let i = 0; i < setbackPoly.length; i++) {
+    const pA = setbackPoly[i]!
+    const pB = setbackPoly[(i + 1) % setbackPoly.length]!
+    const edgeLen = Math.hypot(pB.x - pA.x, pB.z - pA.z)
+    const steps = Math.max(1, Math.ceil(edgeLen / 1.0))
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps
+      const sx = pA.x + (pB.x - pA.x) * t
+      const sz = pA.z + (pB.z - pA.z) * t
+      const surf = getRoofSurfaceAtLocalPoint(sx, sz, props.roofModel, scene)
+      setbackPts.push(new Vector3(sx, surf.y + 0.03, sz))
+    }
+  }
+
+  if (setbackPts.length >= 3) {
+    setbackPts.push(setbackPts[0]!.clone())
+    setbackLineMesh = MeshBuilder.CreateLines('setback_outline', { points: setbackPts }, scene)
+    setbackLineMesh.color = new Color3(0.06, 0.75, 0.9) // Cyan usable setback line
+    setbackLineMesh.isPickable = false
+  }
 }
 
 /**
  * 3. Build Photovoltaic Panels physically placed inside boundary.
  */
 function buildPlacedSolarPanels() {
-  if (!scene || !props.showPanels || props.hiddenObjectTypes?.includes('panel')) return
+  if (!scene) return
   panelMeshes.forEach(m => m.dispose())
   panelMeshes = []
+  disposeRootNodesByPrefix('panelRoot_')
+
+  if (!props.showPanels || props.hiddenObjectTypes?.includes('panel')) return
 
   const panels = currentPanelsList.value
   if (!panels || panels.length === 0) return
@@ -649,6 +858,8 @@ function buildObstacles() {
   if (!scene) return
   obstacleMeshes.forEach(m => m.dispose())
   obstacleMeshes = []
+  disposeRootNodesByPrefix('treeRoot_')
+  disposeRootNodesByPrefix('obsRoot_')
 
   const obsList = currentObstaclesList.value
   if (!obsList || obsList.length === 0) return
@@ -713,6 +924,15 @@ function buildObstacles() {
       obstacleMeshes.push(canopy)
     } else {
       const obsRoot = new TransformNode(`obsRoot_${obsId}`, scene!)
+      if (
+        obs.type !== 'Building' &&
+        modelFootprint2D.value.length >= 3 &&
+        pointInPolygon({ x: posX, z: posZ }, modelFootprint2D.value)
+      ) {
+        const surf = getRoofSurfaceAtLocalPoint(posX, posZ, props.roofModel, scene)
+        posY = surf.y
+        obsRoot.rotationQuaternion = computePanelRotationQuaternion(surf.normal, obs.rotationY || 0)
+      }
       obsRoot.position = new Vector3(posX, posY, posZ)
       obsRoot.metadata = { id: obsId, type: 'obstruction', data: obs }
       rootNodesMap.set(`obsRoot_${obsId}`, obsRoot)
@@ -763,9 +983,12 @@ function buildObstacles() {
  * Strictly data-driven: Attached flush directly to the reconstructed roof surface using getRoofSurfaceAtLocalPoint.
  */
 function buildRooftopFeatures() {
-  if (!scene || props.hiddenObjectTypes?.includes('roof_feature')) return
+  if (!scene) return
   featureMeshes.forEach(m => m.dispose())
   featureMeshes = []
+  disposeRootNodesByPrefix('featRoot_')
+
+  if (props.hiddenObjectTypes?.includes('roof_feature')) return
 
   const features = currentFeaturesList.value
   if (!features || features.length === 0) return
@@ -1064,12 +1287,14 @@ function buildRoofVertexHandles() {
   if (props.activeTool !== 'edit_roof') return
 
   const seg = props.roofModel?.segments?.[0] || props.roofModel?.roofSegments?.[0]
-  if (!seg || !seg.vertices || seg.vertices.length < 3) return
+  const fp2D = extractVerifiedFootprint2D(props.roofModel, seg)
+  if (!seg || fp2D.length < 3) return
 
-  const topPerimeterPts = seg.vertices.slice(0, Math.floor(seg.vertices.length / 2))
-  topPerimeterPts.forEach((v, vIdx) => {
+  const eaveY = seg.eaveHeightM ?? props.roofModel?.eaveHeightM ?? 3.5
+  fp2D.forEach((v, vIdx) => {
+    const perimY = seg.perimeter3D?.[vIdx]?.y ?? eaveY
     const handleMesh = MeshBuilder.CreateSphere(`vertexHandle_${vIdx}`, { diameter: 0.65, segments: 12 }, scene!)
-    handleMesh.position = new Vector3(v.x, v.y + 0.1, v.z)
+    handleMesh.position = new Vector3(v.x, perimY + 0.1, v.z)
     handleMesh.material = vertexHandleMat
     handleMesh.isPickable = true
     handleMesh.metadata = { id: `vertex-${vIdx}`, type: 'roof_vertex', vertexIndex: vIdx }
@@ -1208,26 +1433,30 @@ function setupPointerInteractions() {
 
 function updatePanelPreview(x: number, y: number, z: number, valid: boolean) {
   if (!scene) return
+  const isLandscape = props.panelOrientation === 'landscape'
+  const w = isLandscape ? (props.panelLengthM || 2.278) : (props.panelWidthM || 1.134)
+  const l = isLandscape ? (props.panelWidthM || 1.134) : (props.panelLengthM || 2.278)
+  const thick = props.panelThicknessM || 0.035
+
   if (!previewPanelRoot) {
     previewPanelRoot = new TransformNode('preview_panel_root', scene)
-    previewPanelMesh = MeshBuilder.CreateBox('preview_panel_mesh', { width: 1.1, depth: 2.2, height: 0.04 }, scene)
-    previewPanelMesh.position.y = 0.04 / 2
+    previewPanelMesh = MeshBuilder.CreateBox('preview_panel_mesh', { width: 1, depth: 1, height: 1 }, scene)
     previewPanelMesh.parent = previewPanelRoot
     previewPanelMesh.isPickable = false
 
-    previewPanelFrameMesh = MeshBuilder.CreateBox('preview_panel_frame', { width: 1.134, depth: 2.278, height: 0.035 }, scene)
-    previewPanelFrameMesh.position.y = 0.035 / 2
+    previewPanelFrameMesh = MeshBuilder.CreateBox('preview_panel_frame', { width: 1, depth: 1, height: 1 }, scene)
     previewPanelFrameMesh.parent = previewPanelRoot
     previewPanelFrameMesh.material = panelFrameMaterial
     previewPanelFrameMesh.isPickable = false
   }
 
-  const isLandscape = props.panelOrientation === 'landscape'
-  const w = isLandscape ? (props.panelLengthM || 2.278) : (props.panelWidthM || 1.134)
-  const l = isLandscape ? (props.panelWidthM || 1.134) : (props.panelLengthM || 2.278)
+  const surfaceW = Math.max(0.2, w - 0.03)
+  const surfaceL = Math.max(0.2, l - 0.03)
+  previewPanelMesh!.scaling = new Vector3(surfaceW, thick, surfaceL)
+  previewPanelMesh!.position.y = thick / 2
 
-  previewPanelMesh!.scaling = new Vector3(w - 0.03, 1, l - 0.03)
-  previewPanelFrameMesh!.scaling = new Vector3(w, 1, l)
+  previewPanelFrameMesh!.scaling = new Vector3(w, thick * 0.9, l)
+  previewPanelFrameMesh!.position.y = (thick * 0.9) / 2
 
   // Snap preview root directly to exact mathematical roof surface
   const surf = getRoofSurfaceAtLocalPoint(x, z, props.roofModel, scene)
@@ -1310,6 +1539,59 @@ function handlePointerDown(pointerInfo: PointerInfo) {
       // Exact mathematical roof surface contact point at (finalX, finalZ)
       const surf = getRoofSurfaceAtLocalPoint(finalX, finalZ, props.roofModel, scene)
       if (!surf.isValid) return
+
+      const candidatePanel: PlacedSolarPanel = {
+        id: 'candidate',
+        x: finalX,
+        y: Number((surf.y + DEFAULT_MOUNTING_CLEARANCE_M).toFixed(4)),
+        z: finalZ,
+        widthM: curW,
+        lengthM: curL,
+        thicknessM: props.panelThicknessM || 0.035,
+        rotationY: isLandscape ? Math.PI / 2 : 0,
+        tiltPitchDeg: surf.pitchDeg,
+        normal: [surf.normal.x, surf.normal.y, surf.normal.z],
+        wattageW: props.panelWattageW || 550,
+        manufacturer: props.panelManufacturer,
+        modelName: props.panelModelName,
+        status: 'VALID'
+      }
+
+      const shadows = (props.shadingAssessment?.shadowPolygons || []).map(s => ({
+        points: s.points.map(pt => ({ x: pt.x, z: pt.z }))
+      }))
+
+      const val = validateIndividualPanel(
+        candidatePanel,
+        modelFootprint2D.value,
+        props.panelSetbackM || 0.5,
+        currentObstaclesList.value,
+        shadows,
+        currentPanelsList.value,
+        props.shadowExclusionEnabled || false,
+        currentFeaturesList.value
+      )
+
+      if (!val.isValid) {
+        previewStatus.value = {
+          visible: true,
+          isValid: false,
+          reason: 'Panel cannot be placed here.',
+          x: finalX,
+          y: surf.y,
+          z: finalZ
+        }
+        return
+      }
+
+      previewStatus.value = {
+        visible: true,
+        isValid: true,
+        reason: 'Panel placement OK',
+        x: finalX,
+        y: surf.y,
+        z: finalZ
+      }
 
       emit('place-object', {
         type: 'panel',
@@ -1520,12 +1802,7 @@ function handlePointerMove(pointerInfo: PointerInfo) {
 
       const surf = getRoofSurfaceAtLocalPoint(candX, candZ, props.roofModel, scene)
       const candY = surf.y
-
-      const seg = props.roofModel?.roofSegments?.[0]
-      const halfLen = seg?.vertices ? Math.floor(seg.vertices.length / 2) : 0
-      const roofPoly = (seg?.vertices && halfLen >= 3)
-        ? seg.vertices.slice(0, halfLen).map(v => ({ x: v.x, z: v.z }))
-        : (props.roofModel?.geometry?.segments?.[0]?.polygon2D || [])
+      const roofPoly = modelFootprint2D.value
 
       const candidatePanel: PlacedSolarPanel = {
         id: 'preview',
@@ -1534,11 +1811,13 @@ function handlePointerMove(pointerInfo: PointerInfo) {
         z: candZ,
         widthM: curW,
         lengthM: curL,
-        thicknessM: 0.04,
+        thicknessM: props.panelThicknessM || 0.035,
         rotationY: isLandscape ? Math.PI / 2 : 0,
         tiltPitchDeg: surf.pitchDeg,
         normal: [surf.normal.x, surf.normal.y, surf.normal.z],
         wattageW: props.panelWattageW || 550,
+        manufacturer: props.panelManufacturer,
+        modelName: props.panelModelName,
         status: 'VALID'
       }
 
@@ -1553,14 +1832,15 @@ function handlePointerMove(pointerInfo: PointerInfo) {
         currentObstaclesList.value,
         shadows,
         currentPanelsList.value,
-        props.shadowExclusionEnabled || false
+        props.shadowExclusionEnabled || false,
+        currentFeaturesList.value
       )
 
       updatePanelPreview(candX, candY, candZ, val.isValid)
       previewStatus.value = {
         visible: true,
         isValid: val.isValid,
-        reason: val.reason || (val.isValid ? 'Valid location' : 'Cannot place panel here'),
+        reason: val.isValid ? 'Panel placement OK' : 'Panel cannot be placed here.',
         x: candX,
         y: candY,
         z: candZ
@@ -1653,26 +1933,128 @@ function handleMeasureClick(point: Vector3) {
 }
 
 // Camera Controls
+function getRoofBoundsInfo(): { center: Vector3; maxSpan: number } {
+  const model = props.roofModel
+  const segs = model?.segments || model?.roofSegments || []
+
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  let minZ = Infinity
+  let maxZ = -Infinity
+  let hasVertices = false
+
+  for (const seg of segs) {
+    if (seg.vertices && seg.vertices.length > 0) {
+      for (const v of seg.vertices) {
+        if (typeof v.x === 'number' && typeof v.y === 'number' && typeof v.z === 'number') {
+          if (v.x < minX) minX = v.x
+          if (v.x > maxX) maxX = v.x
+          if (v.y < minY) minY = v.y
+          if (v.y > maxY) maxY = v.y
+          if (v.z < minZ) minZ = v.z
+          if (v.z > maxZ) maxZ = v.z
+          hasVertices = true
+        }
+      }
+    }
+  }
+
+  if (!hasVertices && model?.geometry?.bounds) {
+    const b = model.geometry.bounds
+    minX = b.minX
+    maxX = b.maxX
+    minY = b.minY
+    maxY = b.maxY
+    minZ = b.minZ
+    maxZ = b.maxZ
+    hasVertices = true
+  }
+
+  if (hasVertices && Number.isFinite(minX) && Number.isFinite(maxX)) {
+    const centerX = (minX + maxX) / 2
+    const centerY = (minY + maxY) / 2
+    const centerZ = (minZ + maxZ) / 2
+    const spanX = Math.max(4, maxX - minX)
+    const spanY = Math.max(1, maxY - minY)
+    const spanZ = Math.max(4, maxZ - minZ)
+    const maxSpan = Math.max(spanX, spanZ, spanY)
+    return {
+      center: new Vector3(centerX, centerY, centerZ),
+      maxSpan
+    }
+  }
+
+  return {
+    center: new Vector3(0, 3.5, 0),
+    maxSpan: 16
+  }
+}
+
+function updateCameraLimitsAndTarget(fitRadius: boolean = false) {
+  if (!camera) return
+  const { center, maxSpan } = getRoofBoundsInfo()
+
+  camera.target = center
+  const minLimit = Math.max(2.5, Number((maxSpan * 0.25).toFixed(2)))
+  const maxLimit = Math.max(80, Number((maxSpan * 5.0).toFixed(2)))
+  camera.lowerRadiusLimit = minLimit
+  camera.upperRadiusLimit = maxLimit
+  camera.lowerBetaLimit = 0.01
+  camera.upperBetaLimit = Math.PI / 2 - 0.02
+
+  if (fitRadius) {
+    const idealRadius = Math.min(maxLimit, Math.max(minLimit * 2.2, Number((maxSpan * 1.65).toFixed(2))))
+    camera.radius = idealRadius
+  } else {
+    camera.radius = Math.min(maxLimit, Math.max(minLimit, camera.radius))
+  }
+}
+
+function zoomIn() {
+  if (!camera) return
+  updateCameraLimitsAndTarget(false)
+  const minR = camera.lowerRadiusLimit ?? 2.5
+  const nextR = Math.max(minR, camera.radius * 0.8)
+  camera.radius = Number(nextR.toFixed(3))
+}
+
+function zoomOut() {
+  if (!camera) return
+  updateCameraLimitsAndTarget(false)
+  const maxR = camera.upperRadiusLimit ?? 120
+  const nextR = Math.min(maxR, camera.radius * 1.25)
+  camera.radius = Number(nextR.toFixed(3))
+}
+
 function setCameraPreset(preset: 'top' | 'front' | 'side' | 'fit' | 'reset') {
   if (!camera) return
+  const { center, maxSpan } = getRoofBoundsInfo()
+  updateCameraLimitsAndTarget(false)
+  const presetRadius = Math.min(
+    camera.upperRadiusLimit ?? 120,
+    Math.max((camera.lowerRadiusLimit ?? 2.5) * 2.4, Number((maxSpan * 1.8).toFixed(2)))
+  )
+
   switch (preset) {
     case 'top':
       camera.alpha = -Math.PI / 2
-      camera.beta = 0.001
-      camera.radius = 32
-      camera.target = new Vector3(0, 3.5, 0)
+      camera.beta = 0.01
+      camera.radius = presetRadius
+      camera.target = center
       break
     case 'front':
       camera.alpha = -Math.PI / 2
-      camera.beta = Math.PI / 2
-      camera.radius = 32
-      camera.target = new Vector3(0, 3.5, 0)
+      camera.beta = Math.PI / 2 - 0.05
+      camera.radius = presetRadius
+      camera.target = center
       break
     case 'side':
       camera.alpha = 0
-      camera.beta = Math.PI / 2
-      camera.radius = 32
-      camera.target = new Vector3(0, 3.5, 0)
+      camera.beta = Math.PI / 2 - 0.05
+      camera.radius = presetRadius
+      camera.target = center
       break
     case 'fit':
     case 'reset':
@@ -1683,8 +2065,7 @@ function setCameraPreset(preset: 'top' | 'front' | 'side' | 'fit' | 'reset') {
 
 function fitCameraToRoof() {
   if (!camera) return
-  camera.target = new Vector3(0, 3.5, 0)
-  camera.radius = 28
+  updateCameraLimitsAndTarget(true)
   camera.alpha = -Math.PI / 3
   camera.beta = Math.PI / 3.2
   emit('reset-camera')
@@ -1713,22 +2094,34 @@ watch(
   }
 )
 
-// 3. Roof Structure / Geometry Watcher
+// 3. Roof Structure / Geometry Watcher (Live 3D Regeneration + Auto-Framing on New Roof)
 watch(
   () => [
+    props.roofModel?.id,
+    props.roofModel?.updatedAt,
+    props.roofModel?.roofType,
+    props.roofModel?.roofThicknessM,
+    props.roofModel?.eaveHeightM,
+    props.roofModel?.segments?.[0]?.roofType,
+    props.roofModel?.segments?.[0]?.pitchDegrees,
+    props.roofModel?.segments?.[0]?.azimuthDegrees,
+    props.roofModel?.segments?.[0]?.vertices?.length,
     props.roofModel?.roofSegments?.[0]?.pitchDegrees,
     props.roofModel?.roofSegments?.[0]?.azimuthDegrees,
     props.roofModel?.roofSegments?.[0]?.vertices?.length,
-    roofStructureType.value,
-    roofPitchDegrees.value,
-    roofAzimuthDegrees.value
+    props.panelSetbackM,
+    props.showSetback
   ],
-  () => {
+  (newVals, oldVals) => {
+    const idChanged = newVals[0] !== oldVals?.[0]
     buildExactRoofMesh()
     buildSetbackOutline()
     buildRoofVertexHandles()
     buildPlacedSolarPanels()
+    buildObstacles()
     buildRooftopFeatures()
+    updateGizmoAndSelection()
+    updateCameraLimitsAndTarget(idChanged)
   }
 )
 
@@ -1739,7 +2132,8 @@ watch(
     props.showPanels,
     props.panelOrientation,
     props.panelWidthM,
-    props.panelLengthM
+    props.panelLengthM,
+    props.panelThicknessM
   ],
   () => {
     buildPlacedSolarPanels()
@@ -1836,12 +2230,32 @@ onMounted(() => {
   if (canvasRef.value) {
     canvasRef.value.addEventListener('contextmenu', handleContextMenu)
   }
+  if (viewerContainerRef.value && typeof ResizeObserver !== 'undefined') {
+    containerResizeObserver = new ResizeObserver(() => {
+      handleResize()
+    })
+    containerResizeObserver.observe(viewerContainerRef.value)
+  }
+  document.addEventListener('fullscreenchange', handleFullscreenChange)
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange)
   window.addEventListener('click', handleGlobalClick)
+  handleFullscreenChange()
 })
 
 onBeforeUnmount(() => {
   isDisposed = true
   isInitialized = false
+  clearFullscreenNotice()
+  if (resizeRafId !== null && typeof window !== 'undefined') {
+    window.cancelAnimationFrame(resizeRafId)
+    resizeRafId = null
+  }
+  if (containerResizeObserver) {
+    containerResizeObserver.disconnect()
+    containerResizeObserver = null
+  }
+  document.removeEventListener('fullscreenchange', handleFullscreenChange)
+  document.removeEventListener('webkitfullscreenchange', handleFullscreenChange)
   window.removeEventListener('resize', handleResize)
   window.removeEventListener('click', handleGlobalClick)
   if (canvasRef.value) {
@@ -1864,6 +2278,11 @@ onBeforeUnmount(() => {
 defineExpose({
   setCameraPreset,
   fitCameraToRoof,
+  zoomIn,
+  zoomOut,
+  toggleFullscreen,
+  resizeViewer: scheduleBabylonResize,
+  isFullscreen,
   setTopView: () => setCameraPreset('top'),
   setSolarDesignView: () => fitCameraToRoof(),
   getCanvas: () => canvasRef.value
@@ -1871,7 +2290,13 @@ defineExpose({
 </script>
 
 <template>
-  <div class="relative w-full h-full min-h-[350px] bg-slate-950 rounded-xl overflow-hidden select-none border border-slate-800">
+  <div
+    ref="viewerContainerRef"
+    :class="[
+      'relative w-full h-full min-h-[260px] bg-slate-950 overflow-hidden select-none',
+      isFullscreen ? 'rounded-none border-0' : 'rounded-xl border border-slate-800'
+    ]"
+  >
     <!-- WebGL Canvas for Babylon.js -->
     <canvas ref="canvasRef" class="w-full h-full block focus:outline-none"></canvas>
 
@@ -1907,18 +2332,18 @@ defineExpose({
         ]"
       >
         <span class="text-sm font-black">{{ previewStatus?.isValid ? '✓' : '✕' }}</span>
-        <span>{{ previewStatus?.isValid ? 'VALID PLACEMENT — Click to place' : (previewStatus?.reason || '') }}</span>
+        <span>{{ activeTool === 'add_panel' ? (previewStatus?.isValid ? 'Panel placement OK' : 'Panel cannot be placed here.') : (previewStatus?.isValid ? 'VALID PLACEMENT — Click to place' : (previewStatus?.reason || '')) }}</span>
       </div>
     </div>
 
     <!-- Top Right Overlay: Floating Camera Controls -->
-    <div class="absolute top-3 right-3 z-10 flex flex-col gap-2 pointer-events-auto items-end">
-      <div class="flex items-center gap-1 bg-slate-900/90 backdrop-blur-md p-1 rounded-xl border border-slate-700 shadow-xl">
+    <div class="absolute top-3 right-3 z-10 flex flex-col gap-2 pointer-events-auto items-end max-w-[calc(100%-1.5rem)]">
+      <div class="flex flex-wrap items-center justify-end gap-1 bg-slate-900/90 backdrop-blur-md p-1 rounded-xl border border-slate-700 shadow-xl">
         <button
           type="button"
           @click="setCameraPreset('top')"
           title="Top Overhead View (Orthogonal for 2D Layout)"
-          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors"
+          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer whitespace-nowrap"
         >
           TOP
         </button>
@@ -1926,7 +2351,7 @@ defineExpose({
           type="button"
           @click="fitCameraToRoof"
           title="Solar 3D Verification View"
-          class="px-2 py-1 text-[10px] font-bold text-cyan-400 hover:text-cyan-300 hover:bg-slate-800 rounded transition-colors"
+          class="px-2 py-1 text-[10px] font-bold text-cyan-400 hover:text-cyan-300 hover:bg-slate-800 rounded transition-colors cursor-pointer whitespace-nowrap"
         >
           3D VIEW
         </button>
@@ -1934,7 +2359,7 @@ defineExpose({
           type="button"
           @click="setCameraPreset('front')"
           title="Front Elevation View"
-          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors"
+          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer whitespace-nowrap"
         >
           FRONT
         </button>
@@ -1942,38 +2367,81 @@ defineExpose({
           type="button"
           @click="setCameraPreset('side')"
           title="Side Profile View"
-          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors"
+          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer whitespace-nowrap"
         >
           SIDE
         </button>
         <div class="w-px h-3 bg-slate-700 mx-0.5"></div>
         <button
           type="button"
+          @click="zoomOut"
+          title="Zoom Out (−)"
+          aria-label="Zoom Out"
+          class="w-6 h-6 flex items-center justify-center text-sm font-bold text-slate-200 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer"
+        >
+          −
+        </button>
+        <button
+          type="button"
+          @click="zoomIn"
+          title="Zoom In (+)"
+          aria-label="Zoom In"
+          class="w-6 h-6 flex items-center justify-center text-sm font-bold text-slate-200 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer"
+        >
+          +
+        </button>
+        <div class="w-px h-3 bg-slate-700 mx-0.5"></div>
+        <button
+          type="button"
           @click="setCameraPreset('fit')"
           title="Fit Camera to Roof Geometry"
-          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors"
+          class="px-2 py-1 text-[10px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 rounded transition-colors cursor-pointer whitespace-nowrap"
         >
           FIT
         </button>
+        <div class="w-px h-3 bg-slate-700 mx-0.5"></div>
+        <button
+          type="button"
+          @click="toggleFullscreen"
+          :title="isFullscreen ? 'Exit Full Screen (ESC)' : 'Expand 3D Viewer to Full Screen'"
+          :aria-label="isFullscreen ? 'Exit Full Screen' : 'Full Screen'"
+          :class="[
+            'px-2 py-1 text-[10px] font-bold rounded transition-colors flex items-center gap-1 cursor-pointer whitespace-nowrap',
+            isFullscreen
+              ? 'bg-rose-600/90 hover:bg-rose-500 text-white shadow-xs'
+              : 'text-slate-200 hover:text-white hover:bg-slate-800'
+          ]"
+        >
+          <span>{{ isFullscreen ? '✕' : '⛶' }}</span>
+          <span>{{ isFullscreen ? 'EXIT FULL SCREEN' : 'FULL SCREEN' }}</span>
+        </button>
+      </div>
+
+      <!-- Optional Non-Technical Fullscreen Availability Message -->
+      <div
+        v-if="fullscreenUnavailableMessage"
+        class="bg-slate-900/95 backdrop-blur-md rounded-lg px-3 py-1.5 border border-amber-500/50 shadow-xl text-amber-200 text-[11px] font-medium"
+      >
+        {{ fullscreenUnavailableMessage }}
       </div>
 
       <!-- Geometry Area Verification Badge -->
       <div
-        v-if="roofAreaSqM > 0"
+        v-if="modelFootprint2D.length >= 3 && displayBabylonAreaM2 > 0"
         class="bg-slate-950/90 backdrop-blur-md rounded-xl p-2.5 border border-slate-800 shadow-xl text-white text-[10px] font-mono space-y-1"
       >
         <div class="flex items-center justify-between gap-3">
           <span class="text-slate-400">Map Area:</span>
-          <span class="font-bold text-slate-100">{{ roofAreaSqM.toFixed(1) }} m²</span>
+          <span class="font-bold text-slate-100">{{ displayMapAreaM2.toFixed(1) }} m²</span>
         </div>
         <div class="flex items-center justify-between gap-3">
           <span class="text-slate-400">Babylon Footprint:</span>
-          <span class="font-bold text-slate-100">{{ babylonFootprintAreaM2.toFixed(1) }} m²</span>
+          <span class="font-bold text-slate-100">{{ displayBabylonAreaM2.toFixed(1) }} m²</span>
         </div>
         <div class="flex items-center justify-between gap-3 pt-0.5 border-t border-slate-800">
           <span class="text-slate-400">Discrepancy:</span>
-          <span :class="isGeometryAreaValid ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'">
-            {{ areaDifferencePercent }}%
+          <span :class="displayAreaValid ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'">
+            {{ displayDiscrepancyPercent }}%
           </span>
         </div>
       </div>
@@ -1984,11 +2452,11 @@ defineExpose({
       <span class="text-[9px] uppercase font-bold tracking-wider text-slate-400 block mb-1">3D SCENE LEGEND</span>
       <div class="flex items-center gap-2">
         <span class="w-2.5 h-2.5 rounded-xs bg-[#3d5475]"></span>
-        <span class="text-slate-300">ROOF FOOTPRINT ({{ roofThicknessM }}m Thickness)</span>
+        <span class="text-slate-300">ROOF FOOTPRINT ({{ displayRoofThicknessM }}m Thickness)</span>
       </div>
       <div class="flex items-center gap-2">
         <span class="w-2.5 h-2.5 rounded-xs border border-cyan-400 bg-cyan-400/20"></span>
-        <span class="text-slate-300">USABLE AREA ({{ setbackM }}m Setback)</span>
+        <span class="text-slate-300">USABLE AREA ({{ displaySetbackM }}m Setback)</span>
       </div>
       <div class="flex items-center gap-2">
         <span class="w-2.5 h-2.5 rounded-xs bg-[#0a1128] border border-blue-400"></span>

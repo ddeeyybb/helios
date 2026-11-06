@@ -227,13 +227,7 @@ function saveLoadAnalysis() {
       <div>
         <div class="flex items-center gap-2">
           <h1 class="text-2xl font-bold text-slate-900 tracking-tight">Intelligent Load Analysis</h1>
-          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-            Demand Analytics
-          </span>
         </div>
-        <p class="text-sm text-slate-500 mt-1">
-          Historical energy billing analysis, daily load curve modeling, and solar self-consumption profiling.
-        </p>
       </div>
 
       <div class="flex items-center gap-2">

@@ -149,6 +149,7 @@ const DEFAULT_EQUIPMENT: EquipmentItem[] = [
 ]
 
 import { useInstallerAuth } from './useInstallerAuth'
+import { hydrateOrUpgradeRoofModel } from '~/utils/roof-mesh-generator'
 
 // Default Installer Settings
 export interface InstallerSettings {
@@ -203,10 +204,37 @@ export function useInstallerData() {
       const storedProjects = localStorage.getItem(PROJECTS_STORAGE_KEY)
       if (storedProjects) {
         const parsed = JSON.parse(storedProjects)
-        // Clean out demo project
+        let upgradedAny = false
+        // Clean out demo project and upgrade any legacy v1 verified roofModel to canonical v2 multi-plane 3D
         projects.value = Array.isArray(parsed)
-          ? parsed.filter((p: any) => p.name !== 'Villa Serena Residential Project')
+          ? parsed
+              .filter((p: any) => p.name !== 'Villa Serena Residential Project')
+              .map((p: any) => {
+                if (p?.roofModel) {
+                  const wasV1 = !p.roofModel.geometryVersion || p.roofModel.geometryVersion < 2
+                  const upgraded = hydrateOrUpgradeRoofModel(p.roofModel)
+                  if (upgraded) {
+                    p.roofModel = upgraded
+                    if (wasV1) {
+                      upgradedAny = true
+                      if (p.roofVerification) {
+                        p.roofVerification.roofType = upgraded.roofType
+                        if (upgraded.mapAreaM2) {
+                          p.roofVerification.verifiedAreaM2 = upgraded.mapAreaM2
+                        }
+                      }
+                    }
+                  } else {
+                    p.roofModel = undefined
+                    upgradedAny = true
+                  }
+                }
+                return p
+              })
           : []
+        if (upgradedAny) {
+          localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects.value))
+        }
       } else {
         projects.value = []
         activeProjectId.value = null

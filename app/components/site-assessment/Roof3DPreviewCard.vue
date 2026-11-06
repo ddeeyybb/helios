@@ -3,7 +3,7 @@ import { useSiteAssessment } from '~/composables/useSiteAssessment'
 import BabylonRoofViewer from '~/components/rooftop/BabylonRoofViewer.vue'
 
 const {
-  roofType,
+  roofStructureType,
   hasSelectedProperty,
   activeRoofModel,
   roofAssessmentStatus,
@@ -53,7 +53,6 @@ const {
         <ClientOnly>
           <BabylonRoofViewer
             :roof-model="activeRoofModel"
-            :building-found="Boolean(activeRoofModel && (activeRoofModel.segments?.length || activeRoofModel.roofSegments?.length))"
             :panel-count="physicalPanelCount || estimatedPanelCount"
             :panel-wattage-w="panelWattageW"
             :system-capacity-kwp="estimatedSystemCapacityKwp"
@@ -89,10 +88,10 @@ const {
         <div class="relative z-10 space-y-1">
           <div class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-800 text-amber-400 text-[10px] font-mono border border-slate-700">
             <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping"></span>
-            <span>Awaiting Roof Boundary</span>
+            <span>Awaiting Verified Roof</span>
           </div>
-          <p class="text-[11px] text-slate-400 max-w-xs mx-auto pt-1">
-            Draw the roof perimeter on the satellite map or use geometric presets to generate the 3D roof model and solar panel layout.
+          <p class="text-[11px] text-slate-300 font-medium max-w-xs mx-auto pt-1">
+            No verified roof yet. Draw and confirm the roof first.
           </p>
         </div>
       </div>
@@ -103,13 +102,15 @@ const {
       <div class="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
         <span class="text-[10px] uppercase font-bold text-slate-400 block">Mesh Status</span>
         <span class="font-semibold text-slate-700">
-          {{ activeRoofModel ? `${activeRoofModel.roofSegments.length} Segments Generated` : 'Pending Boundary' }}
+          {{ activeRoofModel ? `${activeRoofModel.geometry?.faces?.length || 0} 3D Facets Active` : 'Pending Verified Roof' }}
         </span>
       </div>
 
       <div class="p-2.5 bg-slate-50 rounded-xl border border-slate-200">
-        <span class="text-[10px] uppercase font-bold text-slate-400 block">Current Classification</span>
-        <span class="font-semibold text-slate-700">{{ roofType }}</span>
+        <span class="text-[10px] uppercase font-bold text-slate-400 block">Roof Structure</span>
+        <span class="font-semibold text-slate-700">
+          {{ activeRoofModel ? (activeRoofModel.roofType || roofStructureType) : 'Unverified' }}
+        </span>
       </div>
     </div>
 
